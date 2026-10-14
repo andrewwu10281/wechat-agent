@@ -1,0 +1,4 @@
+anthropic>=0.40
+requests
+python-dotenv
+qrcode[pil]

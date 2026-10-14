@@ -1,0 +1,100 @@
+# 微信 AI Agent（个人版）
+
+一个接入**个人微信**的 AI Agent：用 **DeepSeek**（Claude 兼容接口）当大脑，微信当入口，
+通过**工具调用（tool calling）**完成查天气、算数、查学者学术信息等任务。
+
+## 功能（对应验收点）
+
+| 验收点 | 工具 | 实现方式 |
+|---|---|---|
+| 查天气 | `get_weather` | 免费 Open-Meteo 接口（无需注册，支持中文城市） |
+| 算数 | `calculate` | Python AST 安全计算（不用 `eval`） |
+| 查学者信息 | `get_scholar_info` | Semantic Scholar 官方 API（免费、免代理、国内可直连），返回引用数/h指数/论文 |
+
+## 架构
+
+```
+微信消息 ──▶ 官方微信后端（扫码登录 + 长轮询）──▶ agent.py（DeepSeek + 工具循环）──▶ 工具函数
+     ▲                                              │
+     └──────────────── 回复文本 ◀────────────────────┘
+```
+
+- `agent.py`：核心 Agent 循环，调用 DeepSeek 的 Anthropic 兼容接口，自动判断该调哪个工具。
+- `tools/`：工具层。除三个专用工具（weather / calculator / scholar）外，还有 `general.py`
+  这一套**通用工具**（见下）。
+- `bot.py`：微信接入层，走腾讯官方微信后端协议（openclaw-weixin 同款），扫码登录收发消息。
+- `.env`：配置（API key、Scholar ID、代理等），不提交到 git。
+
+## 通用工具（harness 底座）
+
+除了那三个专用工具，项目还给模型一套**通用能力**，由模型自己组合完成任务——这和
+Codex / Claude Code 等真实 harness 的做法一致。**不为每个需求写专用工具，而是给基础工具、
+让模型编排。** 更细的工具将来可通过 MCP 的方式注册进来。
+
+| 通用工具 | 作用 |
+|---|---|
+| `run_command` | 在项目目录下运行一条命令行命令（可跑脚本、做计算等） |
+| `read_file` / `write_file` / `edit_file` | 读、写、改文件 |
+| `list_files` / `search_text` | 按通配符列文件 / 按正则全文检索（类 glob / grep） |
+| `web_fetch` | 联网抓取网页文本（可用于检索、查资料等） |
+
+有了这套底线能力，像"算数""查天气/查资料"这类可组合的问题，模型可以**自己用
+`run_command` 跑脚本、用 `web_fetch` 联网**完成，不必预先写死成专用工具。
+
+> ⚠️ 安全提示：`run_command` 能在项目目录下执行命令，`read_file` 等文件操作被限制在项目目录内，
+> 但这**不是真正的沙箱**。请只在可信、本地的环境使用，不要把带 `run_command` 的机器人暴露给不信任的人。
+
+## 环境要求
+
+- Python 3.8+（本机 3.13 已实测）
+- Windows / Linux / macOS 均可（不再依赖 wcferry，无需特定微信 PC 版本、无需注入）
+
+## 安装步骤
+
+### 1. 安装 Python 依赖
+
+```bash
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+```
+
+### 2. 配置 `.env`
+
+打开 `.env`，确认/填写：
+
+- `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL`：默认已配好（DeepSeek 官方接口）。
+- `SCHOLAR_ID`：你自己的 Semantic Scholar 作者 ID（按姓名搜索后返回的那串数字，查"我的 Scholar"用，可选）。
+
+### 3. 启动机器人
+
+```bash
+.venv\Scripts\python bot.py
+```
+
+首次运行会弹出二维码，用手机微信「扫一扫」扫码并确认授权；登录成功后即开始接收消息。
+换号或凭证失效时用 `.venv\Scripts\python bot.py --relogin` 重新登录。
+
+## 使用
+
+**命令行直接测试（不碰微信）：**
+
+```bash
+.venv\Scripts\python agent.py "北京今天天气怎么样"
+.venv\Scripts\python agent.py "帮我算 12345*678+91"
+.venv\Scripts\python agent.py "查一下 Andrew Ng 的学术信息"
+.venv\Scripts\python agent.py "用命令行算 2025*4，并列出项目里的 .py 文件"   # 走通用工具
+.venv\Scripts\python agent.py              # 交互模式
+```
+
+**微信里：** 登录成功后，给你的小号发消息即可自动回复。
+
+## 微信接入说明
+
+- 走腾讯官方微信后端 `ilinkai.weixin.qq.com`（openclaw-weixin 渠道插件同款协议），扫码登录。
+- 不需要注入微信客户端、不碰 DLL、没有「版本必须匹配」的坑、没有 Hook 封号风险。
+- 登录凭证保存在 `.wcbot_session.json`（已加入 `.gitignore`，勿提交）。
+
+## 风险提示
+
+- 查学者信息走 Semantic Scholar 免费 API，免代理、国内可直连；但免费额度偶尔会限流（429），工具已内置退避重试。
+- 建议用小号测试，控制发送频率。
