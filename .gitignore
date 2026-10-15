@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .wcbot_session.json
 .wcbot_qr.png
+*.log

@@ -1,9 +1,0 @@
-✅ 已使用本地凭证，bot id: 8222f3993612@im.bot
-
-===== 微信机器人已启动，开始接收消息（Ctrl+C 退出）=====
-
-2026-10-05 16:12:08,426 [INFO] wechat-bot: 收到消息来自 o9cq80556FN8gM2v_Fp8i9kzXfk0@im.wechat：查一下Andrew Ng的学术信息
-2026-10-05 16:12:08,643 [INFO] httpx2: HTTP Request: POST https://api.deepseek.com/anthropic/v1/messages "HTTP/1.1 200 OK"
-2026-10-05 16:12:15,339 [INFO] httpx2: HTTP Request: POST https://api.deepseek.com/anthropic/v1/messages "HTTP/1.1 200 OK"
-2026-10-05 16:12:22,935 [INFO] httpx2: HTTP Request: POST https://api.deepseek.com/anthropic/v1/messages "HTTP/1.1 200 OK"
-2026-10-05 16:12:30,718 [INFO] wechat-bot: 已回复 o9cq80556FN8gM2v_Fp8i9kzXfk0@im.wechat

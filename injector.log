@@ -1,8 +1,0 @@
-[Inject] Driver.EnsureLoaded => 0xC0000022
-[Inject] Attach(51340) => 0x00000000
-[Inject] Read 1982976 bytes from 'C:\Users\lenovo\wechat-agent\.venv\Lib\site-packages\wcferry\spy_debug.dll'
-[Inject] MapImage => 0xC000010A
-[Inject] Driver.EnsureLoaded => 0xC0000022
-[Inject] Attach(44904) => 0x00000000
-[Inject] Read 1982976 bytes from 'C:\Users\lenovo\wechat-agent\.venv\Lib\site-packages\wcferry\spy_debug.dll'
-[Inject] MapImage => 0xC000010A
