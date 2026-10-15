@@ -1,4 +1,4 @@
-# 微信 AI Agent（个人版）
+# 微信 AI Agent
 
 一个接入**个人微信**的 AI Agent：用 **DeepSeek**（Claude 兼容接口）当大脑，微信当入口，
 通过**工具调用（tool calling）**完成查天气、算数、查学者学术信息等任务。
@@ -22,14 +22,13 @@
 - `agent.py`：核心 Agent 循环，调用 DeepSeek 的 Anthropic 兼容接口，自动判断该调哪个工具。
 - `tools/`：工具层。除三个专用工具（weather / calculator / scholar）外，还有 `general.py`
   这一套**通用工具**（见下）。
-- `bot.py`：微信接入层，走腾讯官方微信后端协议（openclaw-weixin 同款），扫码登录收发消息。
+- `bot.py`：微信接入层，走腾讯官方微信后端协议，扫码登录收发消息。
 - `.env`：配置（API key、Scholar ID、代理等），不提交到 git。
 
-## 通用工具（harness 底座）
+## 通用工具
 
 除了那三个专用工具，项目还给模型一套**通用能力**，由模型自己组合完成任务——这和
-Codex / Claude Code 等真实 harness 的做法一致。**不为每个需求写专用工具，而是给基础工具、
-让模型编排。** 更细的工具将来可通过 MCP 的方式注册进来。
+Codex / Claude Code 等做法一致。
 
 | 通用工具 | 作用 |
 |---|---|
@@ -47,8 +46,7 @@ Codex / Claude Code 等真实 harness 的做法一致。**不为每个需求写�
 ## 环境要求
 
 - Python 3.8+（本机 3.13 已实测）
-- Windows / Linux / macOS 均可（不再依赖 wcferry，无需特定微信 PC 版本、无需注入）
-
+- Windows / Linux / macOS 均可
 ## 安装步骤
 
 ### 1. 安装 Python 依赖
@@ -86,13 +84,10 @@ python -m venv .venv
 .venv\Scripts\python agent.py              # 交互模式
 ```
 
-**微信里：** 登录成功后，给你的小号发消息即可自动回复。
 
 ## 微信接入说明
 
-- 走腾讯官方微信后端 `ilinkai.weixin.qq.com`（openclaw-weixin 渠道插件同款协议），扫码登录。
-- 不需要注入微信客户端、不碰 DLL、没有「版本必须匹配」的坑、没有 Hook 封号风险。
-- 登录凭证保存在 `.wcbot_session.json`（已加入 `.gitignore`，勿提交）。
+- 登录凭证保存在 `.wcbot_session.json`（已加入 `.gitignore`）。
 
 ## 风险提示
 
