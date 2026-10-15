@@ -2,7 +2,7 @@
 
 > 本科实践课项目：写一个接入个人微信的 agent，用 DeepSeek 当大脑。
 > 验收点：查天气、算数、查 Google Scholar。
-> 最近更新：2026-10-14
+> 最近更新：2026-10-15
 
 ## 项目位置
 `C:\Users\lenovo\wechat-agent`
@@ -35,6 +35,14 @@
    - 已实测：`agent.py` 能自行调用 `run_command` 算数、`list_files` 列文件，未用到专用工具
    - ⚠️ 安全：`run_command` 能在项目目录下执行命令，文件操作限制在项目目录内，
      但**不是真正的沙箱**；请勿把带 `run_command` 的机器人暴露给不信任的人
+6. **退役三个专用工具，改为「通用工具干活」的新版本**（2026-10-15）：
+   - `agent.py` 的 `TOOLS` 菜单和 `_exec` 分发器里**移除** weather / calculator / scholar 三项；
+     `SYSTEM` 提示改为"用通用工具自己组合完成"，并附上 Open-Meteo / Semantic Scholar 的调用方式
+   - 三个专用工具的**文件仍保留**在 `tools/`，仅作为历史参考（不再注册给模型）
+   - 旧版本已打标签 `v1-specialized-tools`，随时可找回：`git checkout v1-specialized-tools`
+   - 实测：问"北京天气"，模型自动用 `web_fetch` 调 Open-Meteo 完成，未使用专用工具
+   - ⚠️ 代价：通用工具做这些任务**更慢**（要多次联网、自行解析），可靠性也略低；
+     追求稳/快的话可切回旧版本
 
 ## ⚠️ 待验证（下一步）
 1. 【可选】实际跑 `python bot.py` 重新扫码（凭证是 10-02 存的，可能已失效），确认微信端 Scholar 也能回复。

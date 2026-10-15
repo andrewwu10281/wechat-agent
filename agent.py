@@ -10,10 +10,10 @@ import sys
 import anthropic
 
 import config
-from tools.weather import get_weather
-from tools.calculator import calculate
-from tools.scholar import get_scholar_info
 from tools import general
+# 三个专用工具（weather / calculator / scholar）已退役：
+# 文件仍保留在 tools/ 作为历史参考，但不再注册给模型；
+# 相关任务改由通用工具（web_fetch / run_command）自行组合完成。
 
 # 用 auth_token（而不是 api_key）让 SDK 走 Authorization: Bearer，跟 Claude Code 一致
 client = anthropic.Anthropic(
@@ -24,51 +24,17 @@ client = anthropic.Anthropic(
 SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任务。
 - 你有一套通用工具：run_command（运行命令）、read_file / write_file / edit_file（读写改文件）、
   list_files / search_text（列文件 / 全文检索）、web_fetch（联网抓取网页）。
-  遇到开放性的任务，请自己组合它们完成：比如「算数」可以用 run_command 跑一段脚本，
-  「查天气 / 查资料」可以用 web_fetch 联网检索。
-- 你还有三个常用的专用工具：get_weather（天气）、calculate（算数）、get_scholar_info（学术）。
-  能用它们更快搞定的，优先用它们。
+- 请自己组合这些通用工具完成任务，常见做法：
+  - 算数：用 run_command 跑一段脚本，例如 python -c "print(12345*678+91)"。
+  - 查天气：用 web_fetch 调 Open-Meteo 免费接口——先地理编码
+    https://geocoding-api.open-meteo.com/v1/search?name=城市&count=1&language=zh 拿经纬度，
+    再查 https://api.open-meteo.com/v1/forecast?latitude=..&longitude=..&current=temperature_2m,weather_code。
+  - 查学者：用 web_fetch 调 Semantic Scholar 接口
+    https://api.semanticscholar.org/graph/v1/author/search?query=名字&fields=name,citationCount,hIndex。
 - 拿到结果后用简洁、自然的中文回答，不要把原始 JSON 或大段数据直接甩给用户。
 - 如果暂时没有合适的工具完成任务，直接说明即可。"""
 
 TOOLS = [
-    {
-        "name": "get_weather",
-        "description": "查询某个城市当前的天气和未来几天的气温。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "城市名，如 北京、上海、New York"}
-            },
-            "required": ["city"],
-        },
-    },
-    {
-        "name": "calculate",
-        "description": "计算数学表达式，支持 + - * / ** % 和小括号。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "expression": {"type": "string", "description": "数学表达式，如 '123*456+7'"}
-            },
-            "required": ["expression"],
-        },
-    },
-    {
-        "name": "get_scholar_info",
-        "description": "查询某位学者（或作者本人）的学术信息：总引用、h指数、论文数、高被引论文等。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "scholar_id": {
-                    "type": "string",
-                    "description": "学者的 Semantic Scholar 作者 ID（一串数字）；留空则查作者本人（需在 .env 配 SCHOLAR_ID）",
-                },
-                "name": {"type": "string", "description": "学者姓名，用于搜索（没有 scholar_id 时用）"},
-            },
-            "required": [],
-        },
-    },
     {
         "name": "run_command",
         "description": "在项目目录下运行一条命令行命令并返回输出。可用来跑脚本、做计算、查看环境等。",
@@ -148,12 +114,6 @@ TOOLS = [
 
 
 def _exec(name: str, args: dict) -> str:
-    if name == "get_weather":
-        return get_weather(args.get("city", ""))
-    if name == "calculate":
-        return calculate(args.get("expression", ""))
-    if name == "get_scholar_info":
-        return get_scholar_info(args.get("scholar_id", ""), args.get("name", ""))
     if name == "run_command":
         return general.run_command(args.get("command", ""))
     if name == "read_file":
