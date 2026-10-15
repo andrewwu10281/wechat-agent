@@ -5,11 +5,13 @@
 
 ## 功能（对应验收点）
 
-| 验收点 | 工具 | 实现方式 |
-|---|---|---|
-| 查天气 | `get_weather` | 免费 Open-Meteo 接口（无需注册，支持中文城市） |
-| 算数 | `calculate` | Python AST 安全计算（不用 `eval`） |
-| 查学者信息 | `get_scholar_info` | Semantic Scholar 官方 API（免费、免代理、国内可直连），返回引用数/h指数/论文 |
+> 本版本**不注册专用工具**：三个验收任务都由模型**自己组合通用工具**完成。
+
+| 验收点 | 怎么完成 |
+|---|---|
+| 查天气 | 模型用 `web_fetch` 调免费 Open-Meteo 接口（先地理编码拿经纬度，再查天气） |
+| 算数 | 模型用 `run_command` 跑一段脚本，如 `python -c "print(12345*678+91)"` |
+| 查学者信息 | 模型用 `web_fetch` 调 Semantic Scholar 接口，返回引用数/h指数/论文 |
 
 ## 架构
 
@@ -20,15 +22,16 @@
 ```
 
 - `agent.py`：核心 Agent 循环，调用 DeepSeek 的 Anthropic 兼容接口，自动判断该调哪个工具。
-- `tools/`：工具层。除三个专用工具（weather / calculator / scholar）外，还有 `general.py`
-  这一套**通用工具**（见下）。
+- `tools/general.py`：**通用工具**，本版本唯一注册给模型的一组工具（见下）。
+- `tools/weather.py`、`calculator.py`、`scholar.py`：早期三个**专用工具**，**已退役**（不再注册
+  给模型），仅作历史保留。想回到带专用工具的旧版本：`git switch -c v1 v1-specialized-tools`。
 - `bot.py`：微信接入层，走腾讯官方微信后端协议，扫码登录收发消息。
 - `.env`：配置（API key、Scholar ID、代理等），不提交到 git。
 
 ## 通用工具
 
-除了那三个专用工具，项目还给模型一套**通用能力**，由模型自己组合完成任务——这和
-Codex / Claude Code 等做法一致。
+本项目给模型一套**通用能力**，由它自己组合完成任务——这和 Codex / Claude Code 等做法一致。
+不为每个需求写专用工具，而是给基础工具、让模型编排。
 
 | 通用工具 | 作用 |
 |---|---|
@@ -91,5 +94,6 @@ python -m venv .venv
 
 ## 风险提示
 
-- 查学者信息走 Semantic Scholar 免费 API，免代理、国内可直连；但免费额度偶尔会限流（429），工具已内置退避重试。
+- 查学者信息走 Semantic Scholar 免费 API，免代理、国内可直连；免费额度偶尔会限流（429），模型遇到失败会自行重试。
+- 通用工具（尤其 `run_command`）权限较大，请只在可信环境使用。
 - 建议用小号测试，控制发送频率。
