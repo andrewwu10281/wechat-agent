@@ -145,16 +145,17 @@ def run(user_text: str, history=None) -> str:
             system=SYSTEM,
             tools=TOOLS,
             messages=messages,
-        )
+        ) #进行网络请求
         messages.append({"role": "assistant", "content": resp.content})
+        #content 是一个列表，里面每个元素是一个字典，type 字段表示内容类型（text / tool_use / tool_result），text 字段是文本内容，tool_use_id 是工具调用的唯一 ID
 
         tool_uses = [b for b in resp.content if b.type == "tool_use"]
         if not tool_uses:
             return "".join(b.text for b in resp.content if b.type == "text").strip()
 
-        results = []
+        results = [] #工具调用结果列表
         for tu in tool_uses:
-            inp = tu.input
+            inp = tu.input #提取输入参数
             if isinstance(inp, str):  # 有的接口会把 input 返回成 JSON 字符串，兜底解析
                 try:
                     inp = json.loads(inp)
@@ -170,7 +171,7 @@ def run(user_text: str, history=None) -> str:
     return "（工具调用次数过多，已停止。）"
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  #只有文件被直接运行时，才会执行下面的代码 被import时不会执行
     if len(sys.argv) > 1:
         q = " ".join(sys.argv[1:])
         print("你：", q)
