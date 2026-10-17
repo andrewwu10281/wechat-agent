@@ -1,4 +1,8 @@
-"""算数工具：用 AST 安全地计算数学表达式，绝不使用 eval 执行任意代码。"""
+"""算数工具（LEGACY / 已退役）：用 AST 安全地计算数学表达式，绝不使用 eval。
+
+注意：当前版本不再把本工具注册给模型，算数改由通用工具 run_command 完成。
+本文件仅作历史保留，见标签 v1-specialized-tools。
+"""
 import ast
 import operator
 

@@ -4,7 +4,7 @@
     - 直连腾讯官方微信后端 https://ilinkai.weixin.qq.com
     - 扫码登录 + 长轮询收发消息，不注入微信客户端、不碰 DLL
     - 无「版本必须匹配」的坑、无 Hook 封号风险
-    - 大脑仍然用 agent.py（DeepSeek + 天气/算数/Scholar 三工具），一个字没改
+    - 大脑仍然用 agent.py（DeepSeek + 通用工具），接入层与大脑完全解耦
 
 用法：
     1. 安装依赖： .venv\\Scripts\\pip install -r requirements.txt

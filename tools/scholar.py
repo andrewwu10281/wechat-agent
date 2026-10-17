@@ -1,4 +1,7 @@
-"""查学者学术信息工具：用 Semantic Scholar 官方 API（免注册、免代理、国内可直连）。
+"""查学者学术信息工具（LEGACY / 已退役）：用 Semantic Scholar 官方 API。
+
+注意：当前版本不再把本工具注册给模型，学术查询改由通用工具 web_fetch 完成。
+本文件仅作历史保留，见标签 v1-specialized-tools。
 
 能查：某学者的总引用数、h 指数、论文数、单位，以及高被引论文列表。
 （替代之前抓 Google Scholar 页面的方案——Google 对代理出口 IP 反爬太严，Semantic Scholar 更稳。）

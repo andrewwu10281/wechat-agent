@@ -1,4 +1,4 @@
-"""Agent 核心：把 DeepSeek（Claude 兼容接口）+ 三个工具串成对话循环。
+"""Agent 核心：把 DeepSeek（Claude 兼容接口）+ 通用工具串成对话循环。
 
 用法：
     python agent.py "北京今天天气怎么样"

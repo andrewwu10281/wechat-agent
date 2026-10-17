@@ -1,4 +1,8 @@
-"""查天气工具：默认用免费的 Open-Meteo（无需注册 key）。"""
+"""查天气工具（LEGACY / 已退役）：默认用免费的 Open-Meteo（无需注册 key）。
+
+注意：当前版本不再把本工具注册给模型，天气查询改由通用工具 web_fetch 完成。
+本文件仅作历史保留，见标签 v1-specialized-tools。
+"""
 import requests
 
 # WMO 天气代码 → 中文描述

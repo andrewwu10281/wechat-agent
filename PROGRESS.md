@@ -14,7 +14,7 @@
 - 天气：Open-Meteo；Scholar：Semantic Scholar 官方 API（免代理、国内直连）
 
 ## ✅ 已完成
-1. `agent.py` 核心循环 + 三工具 —— 已跑通（`smoke_test.py`）
+1. `agent.py` 核心循环（最初为三个专用工具）—— 已跑通（`smoke_test.py`）
 2. `bot.py` 已从 wcferry 换成官方后端协议：
    - 二维码登录（`get_bot_qrcode` → 长轮询 `get_qrcode_status`）
    - 收发消息（`getupdates` 长轮询 / `sendmessage`），回传 `context_token`
@@ -57,7 +57,7 @@
 | 用途 | 命令 |
 |---|---|
 | 命令行测 agent | `.venv\Scripts\python agent.py "xxx"` |
-| 冒烟测试（三工具） | `.venv\Scripts\python smoke_test.py` |
+| 冒烟测试（验收点 + 通用工具） | `.venv\Scripts\python smoke_test.py` |
 | 跑微信 bot（扫码登录） | `.venv\Scripts\python bot.py` |
 | 重新扫码登录 | `.venv\Scripts\python bot.py --relogin` |
 
