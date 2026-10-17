@@ -51,6 +51,7 @@ ILINK_APP_CLIENT_VERSION = _enc_client_version(CHANNEL_VERSION)  # 2.4.9 -> "132
 SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".wcbot_session.json")
 QR_PNG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".wcbot_qr.png")
 MAX_QR_REFRESH = 3
+MAX_HISTORY = 20   # 每个用户保留的最近消息条数（约 10 轮对话），控制 token 成本
 
 LOG = logging.getLogger("wechat-bot")
 
@@ -289,7 +290,8 @@ def _extract_text(msg: dict) -> str:
     return ""
 
 
-def _handle_msg(sess: dict, msg: dict, context_tokens: dict) -> None:
+def _handle_msg(sess: dict, msg: dict, context_tokens: dict,
+                histories: dict, seen_ids: set) -> None:
     # 只处理用户发来的消息（message_type==1），忽略 bot 自己发的（2）
     if msg.get("message_type") != 1:
         return
@@ -301,15 +303,37 @@ def _handle_msg(sess: dict, msg: dict, context_tokens: dict) -> None:
     if not from_user:
         return
 
+    # 忽略自己发出的消息，避免自回复回环
+    if from_user == sess.get("ilink_bot_id"):
+        return
+
+    # 幂等去重：同一条消息被重复投递（长轮询重试 / 书签回退）时只处理一次
+    mid = msg.get("msg_id") or msg.get("server_id") or msg.get("client_id")
+    if mid:
+        if mid in seen_ids:
+            LOG.info("跳过重复消息 %s", mid)
+            return
+        seen_ids.add(mid)
+        if len(seen_ids) > 2000:
+            seen_ids.clear()
+
     LOG.info("收到消息来自 %s：%s", from_user, text)
     if ctx:
         context_tokens[from_user] = ctx
 
+    hist = histories.get(from_user, [])
     try:
-        answer = run(text)
+        answer = run(text, hist)          # 带上该用户的历史，实现多轮记忆
     except Exception as e:
         LOG.exception("调用 agent 失败")
         answer = f"抱歉，出了点问题：{e}"
+    else:
+        # 把这一轮追加进历史，只保留最近 MAX_HISTORY 条（接口无状态，每轮都要重播，不能无限涨）
+        hist = hist + [
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+        ]
+        histories[from_user] = hist[-MAX_HISTORY:]
 
     send_text(sess, from_user, answer, ctx or context_tokens.get(from_user, ""))
     LOG.info("已回复 %s", from_user)
@@ -341,6 +365,8 @@ def main() -> None:
     cursor = ""
     timeout_ms = 35_000
     context_tokens: dict = {}  # user_id -> 最近一次 context_token
+    histories: dict = {}       # user_id -> 对话历史
+    seen_ids: set = set()      # 已处理过的消息 id，用于去重
 
     try:
         while True:
@@ -364,7 +390,7 @@ def main() -> None:
 
             for msg in resp.get("msgs", []):
                 try:
-                    _handle_msg(sess, msg, context_tokens)
+                    _handle_msg(sess, msg, context_tokens, histories, seen_ids)
                 except Exception:
                     LOG.exception("处理消息时出错")
     finally:
