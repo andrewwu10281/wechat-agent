@@ -61,10 +61,4 @@
 | 跑微信 bot（扫码登录） | `.venv\Scripts\python bot.py` |
 | 重新扫码登录 | `.venv\Scripts\python bot.py --relogin` |
 
-## 兜底方案（保底交付）
-命令行演示完全可用：
-```bash
-.venv\Scripts\python agent.py "北京今天天气怎么样"
-.venv\Scripts\python agent.py "帮我算 12345*678+91"
-.venv\Scripts\python agent.py "查一下 Andrew Ng 的学术信息"
-```
+
