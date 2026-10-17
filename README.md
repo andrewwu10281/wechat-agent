@@ -75,18 +75,6 @@ python -m venv .venv
 首次运行会弹出二维码，用手机微信「扫一扫」扫码并确认授权；登录成功后即开始接收消息。
 换号或凭证失效时用 `.venv\Scripts\python bot.py --relogin` 重新登录。
 
-## 使用
-
-**命令行直接测试（不碰微信）：**
-
-```bash
-.venv\Scripts\python agent.py "北京今天天气怎么样"
-.venv\Scripts\python agent.py "帮我算 12345*678+91"
-.venv\Scripts\python agent.py "查一下 Andrew Ng 的学术信息"
-.venv\Scripts\python agent.py "用命令行算 2025*4，并列出项目里的 .py 文件"   # 走通用工具
-.venv\Scripts\python agent.py              # 交互模式
-```
-
 
 ## 微信接入说明
 
