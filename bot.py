@@ -27,6 +27,8 @@ import time
 from urllib.parse import quote
 import requests  #发 HTTP 请求（收消息、发消息)
 from agent import run
+from tools.context import set_current_user
+from tools.todos import due_reminders, mark_reminded
 
 
 MAX_QR_REFRESH = 3
@@ -415,6 +417,9 @@ def _handle_msg(sess: dict, msg: dict, context_tokens: dict,
     if ctx:
         context_tokens[from_user] = ctx
 
+    #告诉待办工具"当前是谁"，保证每个人只读写自己的待办
+    set_current_user(from_user)
+
     #调 agent，维护历史
     hist = histories.get(from_user, [])
     try:
@@ -441,6 +446,17 @@ def _handle_msg(sess: dict, msg: dict, context_tokens: dict,
 # ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
+def _send_due_reminders(sess: dict) -> None:
+    """检查到点的待办，主动发微信提醒（每条只提醒一次）。"""
+    for t in due_reminders():
+        try:
+            send_text(sess, t["user_id"], f"⏰ 提醒：{t['text']}")
+            mark_reminded(t["id"])
+            LOG.info("已发送提醒：%s", t["text"])
+        except Exception:
+            LOG.exception("发送提醒失败")
+
+
 def main() -> None:
     #配置日志输出格式和级别
     logging.basicConfig(
@@ -475,6 +491,8 @@ def main() -> None:
     try:
         #主循环：一直长轮询，收到消息就处理
         while True:
+            #每轮先检查有没有到点的待办，有就主动提醒
+            _send_due_reminders(sess)
             try:
                 resp = get_updates(sess, cursor, timeout_ms)  #打一通电话等消息
             except KeyboardInterrupt:

@@ -7,11 +7,12 @@
 import json
 import logging
 import sys
+from datetime import datetime
 
 import anthropic
 
 import config
-from tools import general
+from tools import general, todos
 # 三个专用工具（weather / calculator / scholar）已退役：
 # 文件仍保留在 tools/ 作为历史参考，但不再注册给模型；
 # 相关任务改由通用工具（web_fetch / run_command）自行组合完成。
@@ -38,8 +39,17 @@ SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任�
     https://api.semanticscholar.org/graph/v1/author/search?query=名字&fields=name,citationCount,hIndex。
 - 工具返回失败、超时或空结果时，必须如实告诉用户「服务暂时不可用」并建议稍后再试；
   禁止编造论文、引用数、作者、链接或任何数据。不确定的信息要说明不确定，不要猜。
+- 待办/提醒：用户说「待办 / 提醒我 / 记住要做…」时调用 add_todo；
+  说「我的待办」调用 list_todos；说「完成第 N 个」用 complete_todo，「删除第 N 个」用 delete_todo。
+  把「明天 9 点」「周五下午 3 点」等换算成 ISO 时间（YYYY-MM-DDTHH:MM:SS），参考下面的当前时间。
 - 拿到结果后用简洁、自然的中文回答，不要把原始 JSON 或大段数据直接甩给用户。
 - 如果暂时没有合适的工具完成任务，直接说明即可。"""
+
+
+def _system_prompt() -> str:
+    """在系统提示里带上当前时间，模型才能把「明天 9 点」换算成具体日期。"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return SYSTEM + f"\n当前时间：{now}（Asia/Shanghai）。"
 
 TOOLS = [
     {
@@ -117,6 +127,41 @@ TOOLS = [
             "required": ["url"],
         },
     },
+    {
+        "name": "add_todo",
+        "description": "添加一条待办或提醒。用户说「待办 / 提醒我 / 记住要做…」时使用。due 用 ISO 时间，没有明确时间就留空。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "待办内容"},
+                "due": {"type": "string", "description": "提醒时间，ISO 格式如 2026-10-24T15:00；可留空"},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "list_todos",
+        "description": "列出当前用户未完成的待办。",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "complete_todo",
+        "description": "把第 N 个未完成待办标记为完成。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"index": {"type": "integer", "description": "编号，从 1 开始"}},
+            "required": ["index"],
+        },
+    },
+    {
+        "name": "delete_todo",
+        "description": "删除第 N 个未完成待办。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"index": {"type": "integer", "description": "编号，从 1 开始"}},
+            "required": ["index"],
+        },
+    },
 ]
 
 
@@ -135,6 +180,14 @@ def _exec(name: str, args: dict) -> str:
         return general.search_text(args.get("pattern", ""), args.get("path", "."))
     if name == "web_fetch":
         return general.web_fetch(args.get("url", ""))
+    if name == "add_todo":
+        return todos.add_todo(args.get("text", ""), args.get("due", ""))
+    if name == "list_todos":
+        return todos.list_todos()
+    if name == "complete_todo":
+        return todos.complete_todo(args.get("index", 0))
+    if name == "delete_todo":
+        return todos.delete_todo(args.get("index", 0))
     return f"未知工具：{name}"
 
 
@@ -149,7 +202,7 @@ def run(user_text: str, history=None) -> str:
         resp = client.messages.create(
             model=config.DEEPSEEK_MODEL,
             max_tokens=2048,
-            system=SYSTEM,
+            system=_system_prompt(),
             tools=TOOLS,
             messages=messages,
         ) #进行网络请求
