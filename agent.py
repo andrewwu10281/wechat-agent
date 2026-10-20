@@ -171,7 +171,7 @@ def run(user_text: str, history=None) -> str:
     return "（工具调用次数过多，已停止。）"
 
 
-if __name__ == "__main__":  #只有文件被直接运行时，才会执行下面的代码 被import时不会执行
+if __name__ == "__main__":  #只有文件被直接运行时才会执行下面的代码 被import时不会执行
     if len(sys.argv) > 1:
         q = " ".join(sys.argv[1:])
         print("你：", q)
