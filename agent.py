@@ -6,6 +6,8 @@
 """
 import json
 import logging
+import os
+import shlex
 import sys
 from datetime import datetime
 
@@ -13,6 +15,11 @@ import anthropic
 
 import config
 from tools import general, memory, todos
+try:
+    from tools.mcp_client import MCPManager, to_anthropic_tools
+except Exception:
+    MCPManager = None
+    to_anthropic_tools = None
 # 三个专用工具（weather / calculator / scholar）已退役：
 # 文件仍保留在 tools/ 作为历史参考，但不再注册给模型；
 # 相关任务改由通用工具（web_fetch / run_command）自行组合完成。
@@ -194,6 +201,37 @@ TOOLS = [
     },
 ]
 
+MCP_PREFIX = "mcp_"
+mcp_client = None
+
+
+def _init_mcp() -> None:
+    """配置了 MCP 服务器（或存在示例服务器）时，把它的工具注册进 TOOLS。"""
+    global mcp_client
+    if MCPManager is None:
+        return
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+        demo = os.path.join(base, "mcp_servers", "demo_server.py")
+        cmd = os.getenv("MCP_SERVER_CMD", "").strip()
+        if cmd:
+            parts = shlex.split(cmd)
+        elif os.path.exists(demo):
+            parts = [sys.executable, demo]
+        else:
+            return
+        mcp_client = MCPManager()
+        mcp_client.start(parts, cwd=base)
+        extra = to_anthropic_tools(mcp_client.list_tools(), MCP_PREFIX)
+        TOOLS.extend(extra)
+        LOG.info("MCP 已连接，注册 %d 个工具：%s", len(extra), [t["name"] for t in extra])
+    except Exception as e:
+        LOG.warning("MCP 初始化失败：%s", e)
+        mcp_client = None
+
+
+_init_mcp()
+
 
 def _exec(name: str, args: dict) -> str:
     if name == "run_command":
@@ -224,6 +262,8 @@ def _exec(name: str, args: dict) -> str:
         return memory.recall_facts(args.get("query", ""))
     if name == "forget_fact":
         return memory.forget_fact(args.get("query", ""))
+    if mcp_client and name.startswith(MCP_PREFIX):
+        return mcp_client.call_tool(name[len(MCP_PREFIX):], args)
     return f"未知工具：{name}"
 
 

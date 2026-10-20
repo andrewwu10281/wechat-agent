@@ -61,6 +61,12 @@
    - 新增 3 个工具：`remember_fact` / `recall_facts` / `forget_fact`
    - `agent.py` 系统提示：说「记住…」用 `remember_fact`；问个人情况先 `recall_facts`
    - 实测：记住「在准备考研」后，再问「你还记得我在准备什么吗」能正确回忆
+10. **接入 MCP（Model Context Protocol）**（2026-10-20）：
+   - 安装 `mcp>=2.0`
+   - 新增 `mcp_servers/demo_server.py`（now / word_count / random_number）
+   - 新增 `tools/mcp_client.py`：后台 asyncio 线程 + 同步桥接
+   - `agent.py` 启动时自动连接 MCP 服务器，把工具注册为 `mcp_*` 并接入 `_exec`
+   - 实测：模型能自行调用 `mcp_now` 并返回时间
 
 ## ⚠️ 待验证（下一步）
 1. 【可选】实际跑 `python bot.py` 重新扫码（凭证是 10-02 存的，可能已失效），确认微信端 Scholar 也能回复。

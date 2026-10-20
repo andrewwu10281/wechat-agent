@@ -62,6 +62,19 @@
 - 说「忘掉考研」→ 删除匹配的记忆；
 - 按用户隔离；`memory.json` 已加入 `.gitignore`。
 
+## MCP 扩展（可插拔工具）
+
+项目内置了一个最小 MCP 示例：
+
+- `mcp_servers/demo_server.py`：暴露 `now` / `word_count` / `random_number` 三个工具；
+- `tools/mcp_client.py`：在后台线程跑 asyncio，把 MCP 工具桥接成同步调用；
+- `agent.py` 启动时自动连接示例服务器，把工具注册成 `mcp_now` 等，模型可直接调用。
+
+想接自己的 MCP 服务器，在 `.env` 里加一行 `MCP_SERVER_CMD=python 路径\你的服务器.py`；
+不设置时默认加载内置示例服务器。
+
+安装依赖：`.venv\Scripts\pip install mcp`（国内可加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`）。
+
 ## 环境要求
 
 - Python 3.8+（本机 3.13 已实测）
