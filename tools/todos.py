@@ -74,7 +74,7 @@ def add_todo(text: str, due: str = "") -> str:
     })
     _save(data)
     tail = f"，提醒时间 {due}" if due else ""
-    return f"已记下待办 #{tid}：{text}{tail}"
+    return f"已记下 #{tid}：{text}{tail}\n\n当前待办：\n{list_todos()}"
 
 
 def list_todos() -> str:
@@ -84,36 +84,52 @@ def list_todos() -> str:
     if not items:
         return "当前没有未完成的待办。"
     lines = []
-    for i, t in enumerate(items, 1):
+    for t in items:
         due = f"（{t['due']}）" if t.get("due") else ""
-        lines.append(f"{i}. {t['text']}{due}")
+        lines.append(f"#{t['id']} {t['text']}{due}")
     return "\n".join(lines)
 
 
-def complete_todo(index: int) -> str:
-    """把第 N 个未完成待办标记为完成。"""
-    data = _load()
+def _resolve(data: dict, target: str):
+    """按 #编号 或 内容关键词 找到一条未完成待办。"""
+    s = (str(target) if target is not None else "").strip()
     items = [t for t in _mine(data) if not t.get("done")]
-    try:
-        target = items[int(index) - 1]
-    except (ValueError, IndexError):
-        return "错误：没有这个编号的待办。"
-    target["done"] = True
-    _save(data)
-    return f"已完成：{target['text']}"
+    if s.startswith("#"):
+        s = s[1:].strip()
+    if s.isdigit():
+        tid = int(s)
+        for t in items:
+            if t.get("id") == tid:
+                return t
+        return None
+    if not s:
+        return None
+    for t in items:
+        if s in t.get("text", ""):
+            return t
+    return None
 
 
-def delete_todo(index: int) -> str:
-    """删除第 N 个未完成待办。"""
+def complete_todo(target: str) -> str:
+    """把指定的待办标记为完成（支持 #编号 或 内容关键词）。"""
     data = _load()
-    items = [t for t in _mine(data) if not t.get("done")]
-    try:
-        target = items[int(index) - 1]
-    except (ValueError, IndexError):
-        return "错误：没有这个编号的待办。"
-    data["todos"] = [t for t in data["todos"] if t.get("id") != target.get("id")]
+    t = _resolve(data, target)
+    if not t:
+        return "错误：没找到对应的待办，请先看「我的待办」里的 #编号。"
+    t["done"] = True
     _save(data)
-    return f"已删除：{target['text']}"
+    return f"已完成：{t['text']}"
+
+
+def delete_todo(target: str) -> str:
+    """删除指定的待办（支持 #编号 或 内容关键词）。"""
+    data = _load()
+    t = _resolve(data, target)
+    if not t:
+        return "错误：没找到对应的待办，请先看「我的待办」里的 #编号。"
+    data["todos"] = [x for x in data["todos"] if x.get("id") != t.get("id")]
+    _save(data)
+    return f"已删除：{t['text']}"
 
 
 def due_reminders(now=None) -> list:

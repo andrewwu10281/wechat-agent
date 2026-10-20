@@ -40,7 +40,8 @@ SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任�
 - 工具返回失败、超时或空结果时，必须如实告诉用户「服务暂时不可用」并建议稍后再试；
   禁止编造论文、引用数、作者、链接或任何数据。不确定的信息要说明不确定，不要猜。
 - 待办/提醒：用户说「待办 / 提醒我 / 记住要做…」时调用 add_todo；
-  说「我的待办」调用 list_todos；说「完成第 N 个」用 complete_todo，「删除第 N 个」用 delete_todo。
+  说「我的待办」调用 list_todos；完成/删除时，先看列表里的 #编号，
+  用 complete_todo / delete_todo 传这个 #编号（或内容关键词，如「交报告」）。
   把「明天 9 点」「周五下午 3 点」等换算成 ISO 时间（YYYY-MM-DDTHH:MM:SS），参考下面的当前时间。
 - 拿到结果后用简洁、自然的中文回答，不要把原始 JSON 或大段数据直接甩给用户。
 - 如果暂时没有合适的工具完成任务，直接说明即可。"""
@@ -146,20 +147,20 @@ TOOLS = [
     },
     {
         "name": "complete_todo",
-        "description": "把第 N 个未完成待办标记为完成。",
+        "description": "把指定待办标记为完成。target 传列表里的 #编号（如 #3）或内容关键词（如 交报告）。",
         "input_schema": {
             "type": "object",
-            "properties": {"index": {"type": "integer", "description": "编号，从 1 开始"}},
-            "required": ["index"],
+            "properties": {"target": {"type": "string", "description": "#编号或内容关键词"}},
+            "required": ["target"],
         },
     },
     {
         "name": "delete_todo",
-        "description": "删除第 N 个未完成待办。",
+        "description": "删除指定待办。target 传列表里的 #编号（如 #3）或内容关键词（如 交报告）。",
         "input_schema": {
             "type": "object",
-            "properties": {"index": {"type": "integer", "description": "编号，从 1 开始"}},
-            "required": ["index"],
+            "properties": {"target": {"type": "string", "description": "#编号或内容关键词"}},
+            "required": ["target"],
         },
     },
 ]
@@ -185,9 +186,9 @@ def _exec(name: str, args: dict) -> str:
     if name == "list_todos":
         return todos.list_todos()
     if name == "complete_todo":
-        return todos.complete_todo(args.get("index", 0))
+        return todos.complete_todo(args.get("target", ""))
     if name == "delete_todo":
-        return todos.delete_todo(args.get("index", 0))
+        return todos.delete_todo(args.get("target", ""))
     return f"未知工具：{name}"
 
 
