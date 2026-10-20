@@ -8,9 +8,11 @@ from datetime import datetime
 
 from mcp.server.mcpserver import MCPServer
 
+#创建一个 MCP 服务器，名字叫 demo
 mcp = MCPServer("demo")
 
 
+#@mcp.tool 装饰器：把这个普通函数注册成一个 MCP 工具
 @mcp.tool(description="返回当前日期和时间")
 def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -27,4 +29,4 @@ def random_number(min_value: int = 1, max_value: int = 100) -> int:
 
 
 if __name__ == "__main__":
-    mcp.run()  # 默认 stdio
+    mcp.run()  # 默认 stdio：由客户端（agent.py）启动

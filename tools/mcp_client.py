@@ -21,19 +21,21 @@ from mcp.client.stdio import stdio_client
 
 class MCPManager:
     def __init__(self):
-        self._loop = None
-        self._thread = None
-        self._session = None
-        self._tools = []
-        self._ready = threading.Event()
-        self._error = None
+        self._loop = None          #后台线程里的 asyncio 事件循环
+        self._thread = None        #后台线程
+        self._session = None       #MCP 会话
+        self._tools = []           #服务器暴露的工具
+        self._ready = threading.Event()  #初始化完成的信号
+        self._error = None         #初始化失败的原因
 
     def start(self, command, cwd=None, timeout=30):
         """启动 MCP 服务器并完成初始化；失败抛异常。"""
+        #开一个后台线程，在里头跑 asyncio
         self._thread = threading.Thread(
             target=self._run_loop, args=(command, cwd), daemon=True
         )
         self._thread.start()
+        #等后台线程完成 initialize + list_tools；最多等 timeout 秒
         if not self._ready.wait(timeout):
             raise TimeoutError("MCP 服务器启动超时")
         if self._error:
@@ -43,6 +45,7 @@ class MCPManager:
         try:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
+            #一直跑，保持 MCP 会话不退出
             self._loop.run_until_complete(self._main(command, cwd))
         except Exception as e:
             self._error = str(e)
@@ -50,11 +53,13 @@ class MCPManager:
 
     async def _main(self, command, cwd):
         try:
+            #用 stdio 和 MCP 服务器通信（会把服务器作为子进程启动）
             params = StdioServerParameters(
                 command=command[0], args=command[1:], cwd=cwd
             )
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
+                    #握手：先 initialize，再要工具列表
                     await session.initialize()
                     result = await session.list_tools()
                     self._tools = result.tools
@@ -74,10 +79,12 @@ class MCPManager:
         """同步调用一个 MCP 工具，返回文本结果。"""
         if not self._session or not self._loop:
             raise RuntimeError("MCP 尚未连接")
+        #把异步调用丢进后台事件循环，主线程在这里等结果
         fut = asyncio.run_coroutine_threadsafe(
             self._session.call_tool(name, arguments or {}), self._loop
         )
         result = fut.result(timeout=timeout)
+        #MCP 返回的是 content 列表，把文本挑出来拼起来
         parts = []
         for item in result.content:
             if getattr(item, "type", "") == "text":
@@ -91,6 +98,7 @@ def to_anthropic_tools(tools, prefix="mcp_"):
     """把 MCP 工具列表转成我们 agent 用的 TOOLS 菜单。"""
     out = []
     for t in tools:
+        #加 mcp_ 前缀，避免和本地工具重名
         out.append({
             "name": f"{prefix}{t.name}",
             "description": t.description or f"MCP 工具 {t.name}",

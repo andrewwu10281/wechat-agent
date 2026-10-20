@@ -201,17 +201,18 @@ TOOLS = [
     },
 ]
 
-MCP_PREFIX = "mcp_"
-mcp_client = None
+MCP_PREFIX = "mcp_"   #MCP 工具统一加这个前缀，避免重名
+mcp_client = None     #MCP 客户端；没连上就是 None
 
 
 def _init_mcp() -> None:
     """配置了 MCP 服务器（或存在示例服务器）时，把它的工具注册进 TOOLS。"""
     global mcp_client
     if MCPManager is None:
-        return
+        return  #没装 mcp 库就跳过，不影响本地工具
     try:
         base = os.path.dirname(os.path.abspath(__file__))
+        #优先用 .env 里的 MCP_SERVER_CMD；没配就用内置示例服务器
         demo = os.path.join(base, "mcp_servers", "demo_server.py")
         cmd = os.getenv("MCP_SERVER_CMD", "").strip()
         if cmd:
@@ -220,12 +221,15 @@ def _init_mcp() -> None:
             parts = [sys.executable, demo]
         else:
             return
+        #启动服务器 + 列出工具
         mcp_client = MCPManager()
         mcp_client.start(parts, cwd=base)
+        #把 MCP 工具转成我们的菜单格式，接到 TOOLS 后面
         extra = to_anthropic_tools(mcp_client.list_tools(), MCP_PREFIX)
         TOOLS.extend(extra)
         LOG.info("MCP 已连接，注册 %d 个工具：%s", len(extra), [t["name"] for t in extra])
     except Exception as e:
+        #MCP 失败不影响本地工具，只记日志
         LOG.warning("MCP 初始化失败：%s", e)
         mcp_client = None
 
