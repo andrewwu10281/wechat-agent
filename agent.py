@@ -5,6 +5,7 @@
     python agent.py                # 进入交互模式
 """
 import json
+import logging
 import sys
 
 import anthropic
@@ -20,6 +21,10 @@ client = anthropic.Anthropic(
     auth_token=config.DEEPSEEK_API_KEY,
     base_url=config.DEEPSEEK_BASE_URL,
 )
+
+MAX_TOOL_ROUNDS = 20   # 最多工具调用轮数（通用工具任务可能要多步，原 8 轮太紧）
+MAX_REPEAT_CALLS = 3   # 同一工具 + 同一参数最多连续重复几次，超过就拦截
+LOG = logging.getLogger("wechat-agent")
 
 SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任务。
 - 你有一套通用工具：run_command（运行命令）、read_file / write_file / edit_file（读写改文件）、
@@ -138,7 +143,9 @@ def run(user_text: str, history=None) -> str:
     messages = list(history) if history else []
     messages.append({"role": "user", "content": user_text})
 
-    for _ in range(8):  # 最多 8 轮工具调用，防止死循环
+    call_counts = {}   # (工具名, 参数) -> 本次 run 里调用了几次
+
+    for round_no in range(1, MAX_TOOL_ROUNDS + 1):
         resp = client.messages.create(
             model=config.DEEPSEEK_MODEL,
             max_tokens=2048,
@@ -161,17 +168,40 @@ def run(user_text: str, history=None) -> str:
                     inp = json.loads(inp)
                 except Exception:
                     inp = {}
+
+            # 重复调用保护：同一工具 + 同一参数调用太多次，就不再执行
+            try:
+                sig = (tu.name, json.dumps(inp, ensure_ascii=False, sort_keys=True))
+            except Exception:
+                sig = (tu.name, repr(inp))
+            call_counts[sig] = call_counts.get(sig, 0) + 1
+
+            if call_counts[sig] > MAX_REPEAT_CALLS:
+                content = ("错误：你已经用完全相同的参数重复调用同一工具多次，结果不会改变。"
+                           "请换一种方法，或如实告诉用户这一步失败了。")
+                LOG.warning("拦截重复工具调用：%s", tu.name)
+            else:
+                LOG.info("第 %d 轮工具调用：%s %s", round_no, tu.name,
+                         json.dumps(inp, ensure_ascii=False)[:200])
+                content = _exec(tu.name, inp)
+                LOG.info("工具结果 %s：%s", tu.name, (content or "")[:200])
+
             results.append({
                 "type": "tool_result",
                 "tool_use_id": tu.id,
-                "content": _exec(tu.name, inp),
+                "content": content,
             })
         messages.append({"role": "user", "content": results})
 
-    return "（工具调用次数过多，已停止。）"
+    return (f"（这个问题需要的步骤太多，我尝试了 {MAX_TOOL_ROUNDS} 轮工具调用仍未完成。"
+            f"请把问题拆小一点再试，或换一种问法。）")
 
 
 if __name__ == "__main__":  #只有文件被直接运行时才会执行下面的代码 被import时不会执行
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     if len(sys.argv) > 1:
         q = " ".join(sys.argv[1:])
         print("你：", q)

@@ -401,7 +401,7 @@ def _handle_msg(sess: dict, msg: dict, context_tokens: dict,
     if from_user == sess.get("ilink_bot_id"):
         return
 
-    # 幂等去重：同一条消息被重复投递（长轮询重试 / 书签回退）时只处理一次
+    # 幂等去重：同一条消息被重复投递（长轮询重试或者书签回退）时只处理一次
     mid = msg.get("msg_id") or msg.get("server_id") or msg.get("client_id")
     if mid:
         if mid in seen_ids:
@@ -415,6 +415,7 @@ def _handle_msg(sess: dict, msg: dict, context_tokens: dict,
     if ctx:
         context_tokens[from_user] = ctx
 
+    #调 agent，维护历史
     hist = histories.get(from_user, [])
     try:
         answer = run(text, hist)          # 带上该用户的历史，实现多轮记忆
@@ -447,9 +448,11 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+    #命令行带 --relogin 就强制重新扫码；否则先读本地凭证
     force_relogin = "--relogin" in sys.argv
     sess = None if force_relogin else load_session()
 
+    #没有凭证（首次使用 / 凭证失效 / --relogin）就扫码登录，并把新凭证存下来
     if not sess:
         print("首次使用（或重新登录），需要扫码连接微信…")
         sess = login_via_qr()
@@ -458,9 +461,11 @@ def main() -> None:
     else:
         print(f"✅ 已使用本地凭证，bot id: {sess.get('ilink_bot_id')}")
 
+    #告诉腾讯"我上线了"（失败不影响收发）
     _notify(sess, "notifystart")
     print("\n===== 微信机器人已启动，开始接收消息（Ctrl+C 退出）=====\n")
 
+    #初始化运行状态：书签、等待时长、每个用户的历史 / context_token、已处理消息 id
     cursor = ""
     timeout_ms = 35_000
     context_tokens: dict = {}  # user_id -> 最近一次 context_token
@@ -468,9 +473,10 @@ def main() -> None:
     seen_ids: set = set()      # 已处理过的消息 id，用于去重
 
     try:
+        #主循环：一直长轮询，收到消息就处理
         while True:
             try:
-                resp = get_updates(sess, cursor, timeout_ms)
+                resp = get_updates(sess, cursor, timeout_ms)  #打一通电话等消息
             except KeyboardInterrupt:
                 break
 
@@ -481,18 +487,23 @@ def main() -> None:
                 time.sleep(60 if errcode == -14 else 2)
                 continue
 
+            #更新书签（读到哪了），下次带着它去，避免重复/遗漏
             buf = resp.get("get_updates_buf")
             if buf:
                 cursor = buf
+
+            #服务端建议的等待时长，限制在 10~60 秒
             if resp.get("longpolling_timeout_ms"):
                 timeout_ms = max(10_000, min(60_000, int(resp["longpolling_timeout_ms"])))
 
+            #这一轮带回来的每条消息逐条处理；单条出错不影响其他消息
             for msg in resp.get("msgs", []):
                 try:
                     _handle_msg(sess, msg, context_tokens, histories, seen_ids)
                 except Exception:
                     LOG.exception("处理消息时出错")
     finally:
+        #无论正常退出还是 Ctrl+C，都告诉腾讯"我下线了"
         _notify(sess, "notifystop")
         print("\n已停止。")
 
