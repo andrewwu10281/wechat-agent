@@ -12,7 +12,7 @@ from datetime import datetime
 import anthropic
 
 import config
-from tools import general, todos
+from tools import general, memory, todos
 # 三个专用工具（weather / calculator / scholar）已退役：
 # 文件仍保留在 tools/ 作为历史参考，但不再注册给模型；
 # 相关任务改由通用工具（web_fetch / run_command）自行组合完成。
@@ -43,6 +43,8 @@ SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任�
   说「我的待办」调用 list_todos；完成/删除时，先看列表里的 #编号，
   用 complete_todo / delete_todo 传这个 #编号（或内容关键词，如「交报告」）。
   把「明天 9 点」「周五下午 3 点」等换算成 ISO 时间（YYYY-MM-DDTHH:MM:SS），参考下面的当前时间。
+- 长期记忆：用户说「记住…」时调用 remember_fact；问「你还记得…」或涉及个人情况/偏好时，
+  先调用 recall_facts 查一下；说「忘掉…」时调用 forget_fact。
 - 拿到结果后用简洁、自然的中文回答，不要把原始 JSON 或大段数据直接甩给用户。
 - 如果暂时没有合适的工具完成任务，直接说明即可。"""
 
@@ -163,6 +165,33 @@ TOOLS = [
             "required": ["target"],
         },
     },
+    {
+        "name": "remember_fact",
+        "description": "记住一条关于用户的事实（长期保留）。用户说「记住…」时使用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "要记住的事实"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "recall_facts",
+        "description": "回忆关于用户的长期记忆。query 为空返回全部，否则按关键词过滤。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "关键词，可空"}},
+            "required": [],
+        },
+    },
+    {
+        "name": "forget_fact",
+        "description": "忘掉包含关键词的长期记忆。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "要忘掉的关键词"}},
+            "required": ["query"],
+        },
+    },
 ]
 
 
@@ -189,6 +218,12 @@ def _exec(name: str, args: dict) -> str:
         return todos.complete_todo(args.get("target", ""))
     if name == "delete_todo":
         return todos.delete_todo(args.get("target", ""))
+    if name == "remember_fact":
+        return memory.remember_fact(args.get("text", ""))
+    if name == "recall_facts":
+        return memory.recall_facts(args.get("query", ""))
+    if name == "forget_fact":
+        return memory.forget_fact(args.get("query", ""))
     return f"未知工具：{name}"
 
 
