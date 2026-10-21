@@ -9,11 +9,13 @@
   3. multi_edit：多处同时改 + 原子性（任一处失败则整批不写入）
   4. write_file：先读后写保护；新文件可直接写
   5. search_text：include 按文件名筛选
-  6. run_command：退出码与 stderr 能传回来
+  6. run_command：结构化结果（状态/退出码/stdout/stderr）、超长输出保留尾部、cwd 参数
+  7. 后台任务：run_background / check_job / kill_job / list_jobs
 """
 import os
 import shutil
 import sys
+import time
 
 from tools import general
 
@@ -138,13 +140,69 @@ def main() -> int:
     r = general.search_text("MARKER_UNIQUE_TEXT", REL_DIR)
     check("不传 include 也能找到", "other.py:1" in r, r[:160])
 
-    print("\n== 6. run_command ==")
+    print("\n== 6. run_command（结构化结果）==")
     r = general.run_command('python -c "import sys; sys.exit(7)"')
-    check("非零退出码会回传", "退出码 7" in r, r[:120])
+    check("失败时状态+退出码清晰", "失败（退出码 7）" in r, r[:120])
+    r = general.run_command('python -c "print(\'hello\')"')
+    check("成功时标注成功", "成功（退出码 0）" in r and "[stdout]" in r and "hello" in r, r[:150])
     r = general.run_command('python -c "import sys; sys.stderr.write(\'boom\')"')
-    check("stderr 会回传", "boom" in r, r[:120])
+    check("stderr 单独标注", "[stderr]" in r and "boom" in r, r[:150])
     r = general.run_command("")
     check("空命令有提示", "命令为空" in r)
+
+    # 超长输出：头部 + 尾部都要保留（报错通常在尾部）
+    with open(os.path.join(BASE, REL_DIR, "bigout.py"), "w", encoding="utf-8") as f:
+        f.write('print("A" * 10000, end="")\nprint("TAIL_MARK")\n')
+    r = general.run_command("python _tmp_phase1_test/bigout.py")
+    check("超长输出保留尾部", "TAIL_MARK" in r, r[-120:])
+    check("超长输出标注中间省略", "中间省略" in r, r[-200:])
+
+    # cwd 参数
+    os.makedirs(os.path.join(BASE, REL_DIR, "sub"), exist_ok=True)
+    r = general.run_command('python -c "import os; print(os.getcwd())"', cwd="_tmp_phase1_test/sub")
+    check("cwd 生效", "sub" in r.lower(), r[:200])
+    r = general.run_command('python -c "print(1)"', cwd="..")
+    check("cwd 越出工作区被拒绝", r.startswith("错误") and "超出工作区" in r, r[:120])
+
+    print("\n== 7. 后台任务 ==")
+    r = general.run_background('python -c "import time; time.sleep(1.5); print(\'BG_DONE\')"')
+    check("后台启动返回任务编号", "job" in r and "已在后台启动" in r, r[:120])
+    jid = r.split("已在后台启动 ")[1].split()[0] if "已在后台启动 " in r else ""
+    r = general.check_job(jid)
+    check("刚启动时显示运行中", "运行中" in r, r[:150])
+    time.sleep(2.6)
+    r = general.check_job(jid)
+    check("跑完后显示已结束", "已结束" in r, r[:150])
+    check("能看到最终输出", "BG_DONE" in r, r[-150:])
+    r = general.list_jobs()
+    check("list_jobs 能列出任务", jid in r, r[:150])
+
+    # 终止一个长任务
+    r = general.run_background('python -c "import time; time.sleep(60)"')
+    jid2 = r.split("已在后台启动 ")[1].split()[0] if "已在后台启动 " in r else ""
+    r = general.kill_job(jid2)
+    check("kill_job 能终止", "已终止" in r, r[:150])
+    time.sleep(0.6)
+    r = general.check_job(jid2)
+    check("被终止后状态为已结束", "已结束" in r, r[:150])
+
+    r = general.check_job("job_not_exist")
+    check("不存在的任务有友好提示", "没有这个后台任务" in r, r[:120])
+    r = general.run_background("")
+    check("后台空命令有提示", "命令为空" in r)
+
+    # wait_job：一次等到结束，不用反复轮询
+    r = general.run_background('python -c "import time; time.sleep(1.2); print(\'WAITED_OK\')"')
+    jid3 = r.split("已在后台启动 ")[1].split()[0] if "已在后台启动 " in r else ""
+    r = general.wait_job(jid3, 30)
+    check("wait_job 一次等到结束", "已结束" in r, r[:150])
+    check("wait_job 带回最终输出", "WAITED_OK" in r, r[-150:])
+    # wait_job 超时：任务没结束时如实说还在运行
+    r = general.run_background('python -c "import time; time.sleep(30)"')
+    jid4 = r.split("已在后台启动 ")[1].split()[0] if "已在后台启动 " in r else ""
+    r = general.wait_job(jid4, 1)
+    check("wait_job 超时会说仍在运行", "还没结束" in r or "仍在运行" in r, r[:150])
+    general.kill_job(jid4)
 
     shutil.rmtree(TMP, ignore_errors=True)
     general.reset_observed()

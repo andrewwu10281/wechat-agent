@@ -35,8 +35,13 @@ MAX_REPEAT_CALLS = 3   # 同一工具 + 同一参数最多连续重复几次，�
 LOG = logging.getLogger("wechat-agent")
 
 SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任务。
-- 你有一套通用工具：run_command（运行命令）、read_file / write_file / edit_file / multi_edit（读写改文件）、
+- 你有一套通用工具：run_command（运行命令）、run_background / wait_job / check_job / kill_job / list_jobs（长任务）、
+  read_file / write_file / edit_file / multi_edit（读写改文件）、
   list_files / search_text（列文件 / 全文检索）、web_fetch（联网抓取网页）。
+- 命令执行：短命令用 run_command（默认超时 60s，可调到 600s）。预计要跑很久的
+  （装依赖、跑测试套件、构建）用 run_background 起后台任务，拿到 job 编号后
+  用 wait_job 等它结束（推荐，一次拿到结果）；需要中途瞄一眼就趁 check_job；
+  不要用 run_command 硬等长任务，也不要靠反复 check_job 空转浪费轮数。
 - 改代码/改文件时，必须遵守这个工作流，不要跳步：
   1) 定位：先用 search_text（可用 include 按 *.py 之类筛选）找到相关位置；
   2) 阅读：再用 read_file 读目标文件。默认只返回前 400 行且带行号，
@@ -73,14 +78,67 @@ def _system_prompt() -> str:
 TOOLS = [
     {
         "name": "run_command",
-        "description": "在项目目录下运行一条命令行命令并返回输出。可用来跑脚本、做计算、查看环境等。",
+        "description": "在项目内运行一条命令并等待它结束，返回状态/退出码/stdout/stderr。适合短命令（默认超时 60s）；耗时长的请用 run_background。",
         "input_schema": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "要执行的命令，例如 python -c \"print(12345*678+91)\""}
+                "command": {"type": "string", "description": "要执行的命令，例如 python -c \"print(12345*678+91)\""},
+                "timeout": {"type": "integer", "description": "超时秒数，默认 60，最大 600"},
+                "cwd": {"type": "string", "description": "工作目录（相对项目根目录），默认项目根目录"},
             },
             "required": ["command"],
         },
+    },
+    {
+        "name": "run_background",
+        "description": "在后台启动命令并立刻返回任务编号，不阻塞。适合装依赖、跑测试、构建这类耗时任务。用 check_job 看进度。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要后台执行的命令"},
+                "cwd": {"type": "string", "description": "工作目录（相对项目根目录），默认项目根目录"},
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "check_job",
+        "description": "查看后台任务的进度和最新输出（默认末尾 2000 字符）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "run_background 返回的任务编号，如 job1"},
+                "tail_chars": {"type": "integer", "description": "返回末尾多少字符，默认 2000"},
+            },
+            "required": ["job_id"],
+        },
+    },
+    {
+        "name": "wait_job",
+        "description": "等待后台任务结束（最多 timeout 秒），返回最终状态和输出末尾。比反复 check_job 轮询更省事。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "任务编号，如 job1"},
+                "timeout": {"type": "integer", "description": "最多等多少秒，默认 60，最大 600"},
+                "tail_chars": {"type": "integer", "description": "返回末尾多少字符，默认 3000"},
+            },
+            "required": ["job_id"],
+        },
+    },
+    {
+        "name": "kill_job",
+        "description": "终止一个仍在运行的后台任务（连同子进程）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"job_id": {"type": "string", "description": "要终止的任务编号"}},
+            "required": ["job_id"],
+        },
+    },
+    {
+        "name": "list_jobs",
+        "description": "列出所有后台任务及其状态。",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "read_file",
@@ -277,7 +335,19 @@ _init_mcp()
 
 def _exec(name: str, args: dict) -> str:
     if name == "run_command":
-        return general.run_command(args.get("command", ""))
+        return general.run_command(args.get("command", ""), args.get("timeout", 60),
+                                  args.get("cwd", ""))
+    if name == "run_background":
+        return general.run_background(args.get("command", ""), args.get("cwd", ""))
+    if name == "check_job":
+        return general.check_job(args.get("job_id", ""), args.get("tail_chars", 2000))
+    if name == "wait_job":
+        return general.wait_job(args.get("job_id", ""), args.get("timeout", 60),
+                                args.get("tail_chars", 3000))
+    if name == "kill_job":
+        return general.kill_job(args.get("job_id", ""))
+    if name == "list_jobs":
+        return general.list_jobs()
     if name == "read_file":
         return general.read_file(args.get("path", ""), args.get("offset", 1), args.get("limit", 400))
     if name == "write_file":

@@ -23,18 +23,27 @@
 import difflib           #相似度比较，用于"没找到原文"时给出最接近的位置
 import fnmatch           #按 *.py 这类通配符筛选文件名
 import glob as _globmod  #按通配符找文件
+import itertools         #生成后台任务的自增编号
 import os                #路径 / 目录 / 文件判断
 import re                #正则（检索、清洗网页）
 import subprocess        #运行命令行命令
+import threading         #后台任务的输出读取线程
+import time              #记录任务耗时
 
 import requests          #发 HTTP 请求，抓网页
 
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  #项目根目录（tools/ 的上一级）
 MAX_OUTPUT = 8000        # 单次返回给模型的字符上限，防止撑爆上下文
 MAX_READ_LINES = 400     # read_file 默认最多返回多少行（大文件请用 offset/limit 分段）
+MAX_COMMAND_TAIL = 3000  # 命令输出超长时，尾部保留多少字符（报错信息通常在尾部）
+MAX_JOB_OUTPUT = 20000   # 每个后台任务最多在内存里留多少字符输出（超出丢最老的）
 
 # 最粗的危险命令拦截（不是沙箱，只是防止明显的灾难性误操作）
 _BLOCKED = ("rm -rf /", "mkfs", "format c:", "del /f /s /q c:\\", ":(){", "dd if=")
+
+# 后台任务表：job_id -> 任务信息（进程、输出缓冲、状态）
+_jobs: dict[str, dict] = {}
+_job_seq = itertools.count(1)   # 自增编号，生成 job1 / job2 ...
 
 # 记录「本进程里读过哪些文件、读的时候它的修改时间是多少」
 # 用途：write_file 的「先读后写」保护——没读过、或读过之后文件又变了，就不许覆盖。
@@ -59,6 +68,31 @@ def _truncate(s: str, limit: int = MAX_OUTPUT) -> str:
     return s
 
 
+def _truncate_middle(s: str, limit: int = MAX_OUTPUT, keep_tail: int = MAX_COMMAND_TAIL) -> str:
+    """超长输出保留「头部 + 尾部」，中间省略。
+
+    为什么不用只砍尾部：命令的**报错信息通常出现在末尾**，只留头部会把最有用的部分丢掉。
+    """
+    s = (s or "").strip()
+    if len(s) <= limit:
+        return s
+    keep_tail = min(keep_tail, limit // 2)
+    head_len = max(0, limit - keep_tail - 40)
+    omitted = len(s) - head_len - keep_tail
+    return (s[:head_len] + f"\n…（中间省略 {omitted} 字符）…\n" + s[-keep_tail:])
+
+
+def _resolve_cwd(cwd: str) -> str:
+    """把命令的工作目录限制在工作区内；不传就用项目根目录。"""
+    cwd = (cwd or "").strip()
+    if not cwd:
+        return WORKSPACE
+    p = _within_workspace(cwd)
+    if not os.path.isdir(p):
+        raise ValueError(f"目录不存在：{cwd}")
+    return p
+
+
 def _line_no(text: str, pos: int) -> int:
     """把字符位置换算成行号（从 1 开始）。"""
     return text.count("\n", 0, max(0, pos)) + 1
@@ -80,8 +114,11 @@ def reset_observed() -> None:
 # ---------------------------------------------------------------------------
 # 命令执行
 # ---------------------------------------------------------------------------
-def run_command(command: str, timeout: int = 60) -> str:
-    """在项目目录下运行一条命令行命令，返回输出（含退出码与 stderr）。"""
+def run_command(command: str, timeout: int = 60, cwd: str = "") -> str:
+    """在项目内运行一条命令，返回结构化结果（执行状态 / 超时 / 退出码 / stdout+stderr）。
+
+    输出超长时保留「头部 + 尾部」——报错通常在尾部，不能只留头部。
+    """
     #去掉首尾空格；空命令直接返回错误
     command = (command or "").strip()
     if not command:
@@ -97,22 +134,170 @@ def run_command(command: str, timeout: int = 60) -> str:
     if any(b in low for b in _BLOCKED):
         return "错误：该命令被安全策略拦截。"
     try:
-        #shell=True：交给系统 shell 执行；cwd=项目目录；capture_output：收集输出
+        workdir = _resolve_cwd(cwd)
+    except ValueError as e:
+        return f"错误：{e}"
+    try:
+        #shell=True：交给系统 shell 执行；capture_output：收集输出
         r = subprocess.run(
-            command, shell=True, cwd=WORKSPACE,
+            command, shell=True, cwd=workdir,
             capture_output=True, text=True, timeout=timeout,
             encoding="utf-8", errors="replace",
         )
     except subprocess.TimeoutExpired:
-        return f"命令超时（>{timeout}s）：{command}\n建议：拆成更小的步骤，或调大 timeout。"
+        return (f"状态：超时（>{timeout}s），命令可能仍在运行或已被终止：{command}\n"
+                f"建议：需要长时间运行的任务改用 run_background 起后台任务，再用 check_job 轮询。")
     except Exception as e:
-        return f"命令执行失败：{e}"
-    #把 stdout 和 stderr 合起来；非 0 退出码也带上，方便模型判断失败
-    out = r.stdout or ""
+        return f"状态：执行失败：{e}"
+    #把 stdout 和 stderr 分开标注，再附退出码，结构清晰便于模型判断
+    parts = [f"状态：{'成功（退出码 0）' if r.returncode == 0 else f'失败（退出码 {r.returncode}）'}"]
+    if r.stdout:
+        parts.append("[stdout]\n" + r.stdout)
     if r.stderr:
-        out += ("\n[stderr]\n" + r.stderr)
-    head = "" if r.returncode == 0 else f"[退出码 {r.returncode}]\n"
-    return _truncate(head + (out or "(无输出)"))
+        parts.append("[stderr]\n" + r.stderr)
+    if not r.stdout and not r.stderr:
+        parts.append("(无输出)")
+    return _truncate_middle("\n".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# 后台任务：长命令（装依赖、跑测试、构建）不该把 agent 卡死
+# ---------------------------------------------------------------------------
+def _job_brief(job: dict) -> str:
+    """一行摘要：状态 + 耗时 + 命令。"""
+    status = "已结束" if job["done"] else "运行中"
+    dur = time.time() - job["started"]
+    rc = f"，退出码 {job['rc']}" if job["done"] else ""
+    return f"{status}{rc}，已运行 {dur:.0f}s，命令：{job['command']}"
+
+
+def run_background(command: str, cwd: str = "") -> str:
+    """在后台启动一条命令，立刻返回任务编号；用 check_job 看进度、kill_job 终止。"""
+    command = (command or "").strip()
+    if not command:
+        return "错误：命令为空。"
+    low = command.lower()
+    if any(b in low for b in _BLOCKED):
+        return "错误：该命令被安全策略拦截。"
+    try:
+        workdir = _resolve_cwd(cwd)
+    except ValueError as e:
+        return f"错误：{e}"
+    try:
+        #stderr 合并进 stdout，保证输出顺序可读
+        proc = subprocess.Popen(
+            command, shell=True, cwd=workdir,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        )
+    except Exception as e:
+        return f"错误：启动失败：{e}"
+
+    jid = f"job{next(_job_seq)}"
+    job = {
+        "id": jid, "command": command, "proc": proc, "buf": [], "size": 0,
+        "dropped": 0, "started": time.time(), "done": False, "rc": None,
+    }
+    _jobs[jid] = job
+
+    def _reader() -> None:
+        #后台线程持续读输出，边读边丢最老的，防止内存无限涨
+        try:
+            for line in proc.stdout:
+                job["buf"].append(line)
+                job["size"] += len(line)
+                while job["size"] > MAX_JOB_OUTPUT and len(job["buf"]) > 1:
+                    job["size"] -= len(job["buf"].pop(0))
+                    job["dropped"] += 1
+        except Exception:
+            pass
+        finally:
+            job["rc"] = proc.wait()
+            job["done"] = True
+
+    threading.Thread(target=_reader, daemon=True).start()
+    return (f"状态：已在后台启动 {jid}\n{_job_brief(job)}\n"
+            f"用 check_job(job_id=\"{jid}\") 查看进度和最新输出；用 kill_job(job_id=\"{jid}\") 终止。")
+
+
+def check_job(job_id: str, tail_chars: int = 2000) -> str:
+    """查看后台任务的进度和最新输出（默认只给末尾 2000 字符）。"""
+    jid = (job_id or "").strip()
+    job = _jobs.get(jid)
+    if not job:
+        ids = "、".join(_jobs) or "（当前没有后台任务）"
+        return f"错误：没有这个后台任务：{job_id}。现有的：{ids}"
+    try:
+        tail_chars = int(tail_chars)
+    except Exception:
+        tail_chars = 2000
+    tail_chars = max(200, min(tail_chars, 8000))
+    out = "".join(job["buf"])
+    note = ""
+    if job["dropped"]:
+        note = f"（早期输出已丢弃 {job['dropped']} 行）\n"
+    if len(out) > tail_chars:
+        out = "…（更早的输出已省略）\n" + out[-tail_chars:]
+    return (f"任务 {jid}：{_job_brief(job)}\n{note}"
+            f"---- 输出末尾 ----\n{out.rstrip() or '(还没有输出)'}")
+
+
+def kill_job(job_id: str) -> str:
+    """终止一个仍在运行的后台任务（连同它派生的子进程）。"""
+    jid = (job_id or "").strip()
+    job = _jobs.get(jid)
+    if not job:
+        return f"错误：没有这个后台任务：{job_id}。"
+    if job["done"]:
+        return f"任务 {jid} 已经结束了（退出码 {job['rc']}），无需终止。"
+    proc = job["proc"]
+    try:
+        if os.name == "nt":
+            #Windows 下用 taskkill 连子进程树一起结束
+            subprocess.run(f"taskkill /F /T /PID {proc.pid}", shell=True,
+                           capture_output=True, timeout=20)
+        else:
+            proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+    except Exception as e:
+        return f"错误：终止失败：{e}"
+    job["done"] = True
+    if job["rc"] is None:
+        job["rc"] = proc.poll()
+    return f"状态：已终止 {jid}（{job['command']}）"
+
+
+def wait_job(job_id: str, timeout: int = 60, tail_chars: int = 3000) -> str:
+    """等后台任务结束（最多 timeout 秒），返回最终状态与输出末尾。
+
+    为什么不只用 check_job 轮询：模型每轮轮询都要走一次 LLM 调用（慢且花钱）。
+    能接受等待时用 wait_job 一次拿到结果，更省也更稳。
+    """
+    jid = (job_id or "").strip()
+    job = _jobs.get(jid)
+    if not job:
+        return f"错误：没有这个后台任务：{job_id}。"
+    try:
+        timeout = int(timeout)
+    except Exception:
+        timeout = 60
+    timeout = max(1, min(timeout, 600))
+    deadline = time.time() + timeout
+    while not job["done"] and time.time() < deadline:
+        time.sleep(0.2)
+    if job["done"]:
+        return check_job(jid, tail_chars)
+    return f"任务 {jid} 在 {timeout}s 内还没结束，仍在运行。\n" + check_job(jid, 1500)
+
+
+def list_jobs() -> str:
+    """列出本次进程里所有后台任务及其状态。"""
+    if not _jobs:
+        return "当前没有后台任务。"
+    return "\n".join(f"- {jid}: {_job_brief(job)}" for jid, job in _jobs.items())
 
 
 # ---------------------------------------------------------------------------
