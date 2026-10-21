@@ -26,13 +26,14 @@ import sys      #获取命令行参数/向标准输出写内容
 import time
 from urllib.parse import quote
 import requests  #发 HTTP 请求（收消息、发消息)
-from agent import run
+from agent import run, compact_history
 from tools.context import set_current_user
 from tools.todos import due_reminders, mark_reminded
 
 
 MAX_QR_REFRESH = 3
-MAX_HISTORY = 20   # 每个用户保留的最近消息条数,控制 token 成本
+# 历史条数硬上限（真正的控制是 token 预算：超预算会把早期对话压成摘要）
+MAX_HISTORY = 200
 DEBUG_MSG = os.getenv("DEBUG_MSG", "") == "1"   # 设 DEBUG_MSG=1 时打印收到的原始消息（调试群聊用）
 LOG = logging.getLogger("wechat-bot") #在模块顶层创建，文件里所有函数都能直接引用LOG
 
@@ -420,20 +421,21 @@ def _handle_msg(sess: dict, msg: dict, context_tokens: dict,
     #告诉待办工具"当前是谁"，保证每个人只读写自己的待办
     set_current_user(from_user)
 
-    #调 agent，维护历史
-    hist = histories.get(from_user, [])
+    #调 agent：先按 token 预算压缩历史（超预算把早期对话压成摘要），再带上历史 + 摘要
+    state = histories.get(from_user) or {"messages": [], "summary": ""}
     try:
-        answer = run(text, hist)          # 带上该用户的历史，实现多轮记忆
+        msgs, summary = compact_history(state.get("messages", []), state.get("summary", ""))
+        answer = run(text, msgs, summary)
     except Exception as e:
         LOG.exception("调用 agent 失败")
         answer = f"抱歉，出了点问题：{e}"
     else:
-        # 把这一轮追加进历史，只保留最近 MAX_HISTORY 条（接口无状态，每轮都要重播，不能无限涨）
-        hist = hist + [
+        # 把这一轮追加进历史；条数硬上限兜底（token 预算才是主要控制）
+        msgs = msgs + [
             {"role": "user", "content": text},
             {"role": "assistant", "content": [{"type": "text", "text": answer}]},
         ]
-        histories[from_user] = hist[-MAX_HISTORY:]
+        histories[from_user] = {"messages": msgs[-MAX_HISTORY:], "summary": summary}
 
     send_text(sess, from_user, answer, ctx or context_tokens.get(from_user, ""))
     LOG.info("已回复 %s", from_user)
@@ -485,7 +487,7 @@ def main() -> None:
     cursor = ""
     timeout_ms = 35_000
     context_tokens: dict = {}  # user_id -> 最近一次 context_token
-    histories: dict = {}       # user_id -> 对话历史
+    histories: dict = {}       # user_id -> {"messages": [...], "summary": "..."}
     seen_ids: set = set()      # 已处理过的消息 id，用于去重
 
     try:

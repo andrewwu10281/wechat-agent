@@ -9,6 +9,7 @@ import logging
 import os
 import shlex
 import sys
+import time
 from datetime import datetime
 
 import anthropic
@@ -32,7 +33,16 @@ client = anthropic.Anthropic(
 
 MAX_TOOL_ROUNDS = 20   # 最多工具调用轮数（通用工具任务可能要多步，原 8 轮太紧）
 MAX_REPEAT_CALLS = 3   # 同一工具 + 同一参数最多连续重复几次，超过就拦截
+MAX_LLM_RETRIES = 3    # 模型调用失败（限流/网络/5xx）最多试几次
+HISTORY_TOKEN_BUDGET = 8000   # 历史（含摘要）的 token 预算，超了就压缩
+KEEP_RECENT_MESSAGES = 6      # 压缩历史时，至少原样保留最近几条消息
+SUMMARY_MAX_TOKENS = 800      # 生成历史摘要时允许的最大输出
 LOG = logging.getLogger("wechat-agent")
+
+# 这些状态码表示"临时性失败"，适合重试；4xx 里的参数错误重试也没用
+_RETRY_STATUS = (408, 409, 425, 429, 500, 502, 503, 504, 529)
+_RETRY_HINTS = ("ratelimit", "timeout", "connection", "overloaded", "apistatus",
+                "internalserver", "serviceunavailable")
 
 SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任务。
 - 你有一套通用工具：run_command（运行命令）、run_background / wait_job / check_job / kill_job / list_jobs（长任务）、
@@ -70,10 +80,145 @@ SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任�
 - 如果暂时没有合适的工具完成任务，直接说明即可。"""
 
 
-def _system_prompt() -> str:
-    """在系统提示里带上当前时间，模型才能把「明天 9 点」换算成具体日期。"""
+def _system_prompt(summary: str = "") -> str:
+    """在系统提示里带上当前时间；有历史摘要就一并附上。
+
+    摘要放进 system（而不是塞进 messages）有两个好处：
+      1) 不破坏 user / assistant 的交替结构；
+      2) 摘要永远是"背景知识"，不会被当成用户刚说的话。
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return SYSTEM + f"\n当前时间：{now}（Asia/Shanghai）。"
+    text = SYSTEM + f"\n当前时间：{now}（Asia/Shanghai）。"
+    if summary:
+        text += f"\n\n以下是更早对话的摘要（供你回忆上下文，不需要复述给用户）：\n{summary}"
+    return text
+
+
+# ---------------------------------------------------------------------------
+# 模型调用：带退避重试
+# ---------------------------------------------------------------------------
+def _is_retryable(exc: Exception) -> bool:
+    """判断这个异常是不是"过一会儿再试就能好"的临时性失败。"""
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int) and code in _RETRY_STATUS:
+        return True
+    name = type(exc).__name__.lower()
+    if any(k in name for k in _RETRY_HINTS):
+        return True
+    txt = str(exc).lower()
+    return any(k in txt for k in ("timeout", "connection", "rate limit", "overloaded", "temporarily"))
+
+
+def _create_message(**kwargs):
+    """调用模型，遇到限流/网络抖动/5xx 自动退避重试。
+
+    为什么要有：接口偶尔 429 或超时，一次失败就让整轮对话报错，体验很差；
+    而这类失败绝大多数重试一次就过了。
+    """
+    last = None
+    for attempt in range(MAX_LLM_RETRIES):
+        try:
+            return client.messages.create(**kwargs)
+        except Exception as e:
+            last = e
+            if attempt == MAX_LLM_RETRIES - 1 or not _is_retryable(e):
+                raise
+            wait = min(2 ** attempt * 2, 20)   # 2s → 4s → 8s（上限 20s）
+            LOG.warning("模型调用失败（第 %d/%d 次）：%s；%.0fs 后重试",
+                        attempt + 1, MAX_LLM_RETRIES, e, wait)
+            time.sleep(wait)
+    raise last  # 理论上到不了这里
+
+
+# ---------------------------------------------------------------------------
+# 上下文预算：历史太长就压成摘要
+# ---------------------------------------------------------------------------
+def estimate_tokens(text: str) -> int:
+    """粗估 token 数（不引入分词器）：中日韩字符按 1 字 1 token，其余按 4 字符 1 token。"""
+    if not text:
+        return 0
+    cjk = 0
+    for ch in text:
+        if "\u4e00" <= ch <= "\u9fff" or "\u3040" <= ch <= "\u30ff" or "\uac00" <= ch <= "\ud7af":
+            cjk += 1
+    other = len(text) - cjk
+    return int(cjk + other / 4) + 1
+
+
+def _content_to_text(content) -> str:
+    """把消息的 content（可能是字符串，也可能是积木列表）压成纯文本。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for block in content:
+            if getattr(block, "type", None) == "text":
+                out.append(getattr(block, "text", "") or "")
+            elif getattr(block, "type", None) == "tool_use":
+                out.append(f"[调用工具 {getattr(block, 'name', '')}]")
+            elif isinstance(block, dict) and block.get("type") == "text":
+                out.append(block.get("text", ""))
+        return " ".join(x for x in out if x)
+    return ""
+
+
+def _messages_tokens(messages) -> int:
+    total = 0
+    for m in messages or []:
+        total += estimate_tokens(_content_to_text(m.get("content")))
+    return total
+
+
+def summarize_history(messages, prev_summary: str = "") -> str:
+    """把一段较早的对话压成简洁摘要（会真实调用一次模型）。"""
+    lines = []
+    for m in messages:
+        text = _content_to_text(m.get("content"))
+        if text:
+            lines.append(f"{'用户' if m.get('role') == 'user' else '助手'}：{text}")
+    body = "\n".join(lines)
+    prompt = ("把下面这段对话压缩成简洁的中文摘要，供之后继续对话时回忆上下文。要求：\n"
+              "1) 保留事实：人名、数字、日期、文件路径、结论、用户偏好、已定的事项；\n"
+              "2) 丢掉寒暄和重复内容；\n"
+              "3) 不要评论或问候，只输出摘要，300 字以内。\n")
+    if prev_summary:
+        prompt += f"\n已有摘要（请合并进来，不要重复）：\n{prev_summary}\n"
+    prompt += f"\n待压缩的对话：\n{body}"
+    resp = _create_message(
+        model=config.DEEPSEEK_MODEL,
+        max_tokens=SUMMARY_MAX_TOKENS,
+        system="你是一个对话摘要助手，只输出摘要正文。",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    return text or prev_summary
+
+
+def compact_history(history, summary: str = "", budget: int = HISTORY_TOKEN_BUDGET,
+                    keep: int = KEEP_RECENT_MESSAGES, summarizer=None):
+    """历史超预算时，把较早的对话压成摘要，保留最近几条原文。
+
+    返回 (新的 history, 新的 summary)；不改动传入的列表。
+    摘要失败时降级为"直接丢掉最老的消息"，保证不会因为压缩而让整轮对话失败。
+    """
+    history = list(history or [])
+    summary = summary or ""
+    if _messages_tokens(history) + estimate_tokens(summary) <= budget:
+        return history, summary
+
+    fn = summarizer or summarize_history
+    guard = 0
+    while (_messages_tokens(history) + estimate_tokens(summary) > budget
+           and len(history) > 2 and guard < 20):
+        guard += 1
+        keep_n = max(2, min(keep, len(history) - 1))
+        old_part, history = history[:-keep_n], history[-keep_n:]
+        try:
+            summary = fn(old_part, summary)
+        except Exception as e:
+            LOG.warning("历史摘要失败，改为直接丢弃最老的消息：%s", e)
+    LOG.info("历史已压缩：剩余 %d 条消息，摘要 %d 字", len(history), len(summary))
+    return history, summary
 
 TOOLS = [
     {
@@ -383,18 +528,21 @@ def _exec(name: str, args: dict) -> str:
     return f"未知工具：{name}"
 
 
-def run(user_text: str, history=None) -> str:
-    """跑一轮 Agent 循环，返回最终文本回答。history 是可选的历史消息列表。"""
+def run(user_text: str, history=None, summary: str = "") -> str:
+    """跑一轮 Agent 循环，返回最终文本回答。
+
+    history 是可选的历史消息列表；summary 是更早对话压缩后的摘要（长期上下文）。
+    """
     messages = list(history) if history else []
     messages.append({"role": "user", "content": user_text})
 
     call_counts = {}   # (工具名, 参数) -> 本次 run 里调用了几次
 
     for round_no in range(1, MAX_TOOL_ROUNDS + 1):
-        resp = client.messages.create(
+        resp = _create_message(               # 带退避重试的模型调用
             model=config.DEEPSEEK_MODEL,
             max_tokens=8192,
-            system=_system_prompt(),
+            system=_system_prompt(summary),   # 岗位说明（当前时间 + 历史摘要）
             tools=TOOLS,
             messages=messages,
         ) #进行网络请求
@@ -454,6 +602,7 @@ if __name__ == "__main__":  #只有文件被直接运行时才会执行下面的
     else:
         print("交互模式，输入消息回车，Ctrl+C 退出。")
         history = []
+        summary = ""      # 更早对话压缩后的摘要
         while True:
             try:
                 q = input("你：")
@@ -461,7 +610,9 @@ if __name__ == "__main__":  #只有文件被直接运行时才会执行下面的
                 break
             if not q.strip():
                 continue
-            ans = run(q, history)
+            # 交互模式也走同一套上下文预算：太长就把早期对话压成摘要
+            history, summary = compact_history(history, summary)
+            ans = run(q, history, summary)
             history.append({"role": "user", "content": q})
             history.append({"role": "assistant", "content": [{"type": "text", "text": ans}]})
             print("助手：", ans)
