@@ -2,7 +2,8 @@
 
 > 本科实践课项目：写一个接入个人微信的 agent，用 DeepSeek 当大脑。
 > 验收点：查天气、算数、查 Google Scholar。
-> 最近更新：2026-10-20
+> 定位演进：不再只是验收项目，目标做成**可日常使用的个人助理**（对标 Codex 的文件/代码能力）。
+> 最近更新：2026-10-21
 
 ## 项目位置
 `C:\Users\lenovo\wechat-agent`
@@ -72,6 +73,30 @@
    - `agent.py`：模型返回空文本时给兜底提示；每轮打印工具调用日志
    - `bot.py`：发送前再兜一次空回复；`DEBUG_MSG=1` 可打印收到的原始消息
    - 实测：天气任务两轮工具调用完成，不再撞 8 轮上限
+12. **Phase 1：文件/代码处理能力对齐 Codex**（2026-10-21）：
+   - 背景：老师指出"文件处理、代码能力不如 Codex"是痛点。定性为**工具层与 harness 纪律**的差距，不是模型能力差距
+   - 发现问题（实测）：`read_file` 只有 `max_chars`、无行号无分段——`agent.py`（12357 字符）只返回 8021 字符
+     **尾部永远读不到**；`edit_file` 是裸字符串替换，无先读后写、无歧义保护、无失败诊断；`write_file` 直接覆盖
+   - `tools/general.py` 改造：
+     - `read_file(path, offset=1, limit=400)`：**返回带行号内容**，分段读大文件，并提示"还有 N 行"
+     - `edit_file(path, old, new, all=False)`：精确匹配优先，不中则**忽略每行首尾空白**匹配；
+       命中多处 → 报错并列出各行号；完全没命中 → 用 difflib 给出**最接近的位置（带行号）**
+     - 新增 `multi_edit(path, edits)`：一个文件多处改动，**原子**执行（任一处失败则整批不写入）
+     - `write_file`：**先读后写保护**——已存在文件必须先 `read_file` 读过，且之后没被改动，才允许覆盖
+     - `run_command`：超时默认 60s、上限 600s，超时提示"拆小步骤或调大 timeout"
+     - `search_text(pattern, path, include)`：新增 `include` 按文件名通配符筛选（如 `*.py`）
+   - `agent.py`：`max_tokens` 2048 → **8192**；`TOOLS` 菜单同步新参数 + 新增 `multi_edit`；
+     `SYSTEM` 加入**强制工作流**：定位(search) → 阅读(read，按行号) → 修改(edit/multi_edit) → 验证(run_command)
+   - 新增 `test_tools.py`：**30 项单元测试全部通过**，覆盖分段读、模糊匹配、歧义拒绝、近似定位、
+     multi_edit 原子性、先读后写保护、include 过滤、退出码/stderr 回传
+   - 端到端实测：让它修 `_demo_edit.py` 里两个 bug，模型自行完成 `read_file` → `multi_edit`（两处原子修改）
+     → `run_command` 验证（`add(2,3)=5`、`average([])=0`、`average([1,2,3])=2.0`），全对
+
+## 📋 后续路线（对标 Codex，逐阶段推进）
+- **Phase 2｜命令执行升级**：结构化结果（退出码/stdout/stderr 分离）、后台运行 + 查状态/终止、`cwd` 参数
+- **Phase 3｜上下文与可靠性**：历史 token 预算 + 自动摘要压缩；LLM 调用重试/退避
+- **Phase 4｜企业级安全**：命令执行的工作区约束与危险操作审批、审计日志
+- **Phase 5｜像助理**：agent 自身的计划跟踪、周期定时任务
 
 ## ⚠️ 待验证（下一步）
 1. 【可选】实际跑 `python bot.py` 重新扫码（凭证是 10-02 存的，可能已失效），确认微信端 Scholar 也能回复。
@@ -86,6 +111,7 @@
 | 用途 | 命令 |
 |---|---|
 | 命令行测 agent | `.venv\Scripts\python agent.py "xxx"` |
+| 工具层单元测试（不花 API 费用） | `.venv\Scripts\python test_tools.py` |
 | 冒烟测试（验收点 + 通用工具） | `.venv\Scripts\python smoke_test.py` |
 | 跑微信 bot（扫码登录） | `.venv\Scripts\python bot.py` |
 | 重新扫码登录 | `.venv\Scripts\python bot.py --relogin` |

@@ -35,8 +35,17 @@ MAX_REPEAT_CALLS = 3   # 同一工具 + 同一参数最多连续重复几次，�
 LOG = logging.getLogger("wechat-agent")
 
 SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任务。
-- 你有一套通用工具：run_command（运行命令）、read_file / write_file / edit_file（读写改文件）、
+- 你有一套通用工具：run_command（运行命令）、read_file / write_file / edit_file / multi_edit（读写改文件）、
   list_files / search_text（列文件 / 全文检索）、web_fetch（联网抓取网页）。
+- 改代码/改文件时，必须遵守这个工作流，不要跳步：
+  1) 定位：先用 search_text（可用 include 按 *.py 之类筛选）找到相关位置；
+  2) 阅读：再用 read_file 读目标文件。默认只返回前 400 行且带行号，
+     文件大的话用 offset/limit 分段读完你需要的部分，不要凭猜测改。
+  3) 修改：只改局部用 edit_file（原文要能唯一定位；命中多处会报错，此时给出更长的原文）；
+     同一个文件要改好几处，用 multi_edit 一次提交，它是原子的——任一处不匹配就整批不写入。
+     只有当整个文件都要重写时才用 write_file；已存在的文件必须先 read_file 读过才允许覆盖。
+  4) 验证：改完用 run_command 跑一遍验证（例如 python -m compileall <文件>、或对应的测试/脚本），
+     并把验证结果如实告诉用户。验证失败就看报错、修正后重试。
 - 请自己组合这些通用工具完成任务，常见做法：
   - 算数：用 run_command 跑一段脚本，例如 python -c "print(12345*678+91)"。
   - 查天气：用 web_fetch 调 Open-Meteo 免费接口——先地理编码
@@ -75,16 +84,20 @@ TOOLS = [
     },
     {
         "name": "read_file",
-        "description": "读取项目内某个文本文件的内容。",
+        "description": "读取项目内某个文本文件，返回带行号的内容。文件较大时用 offset/limit 分段读取。",
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string", "description": "相对项目根目录的文件路径"}},
+            "properties": {
+                "path": {"type": "string", "description": "相对项目根目录的文件路径"},
+                "offset": {"type": "integer", "description": "从第几行开始读（1 表示第一行），默认 1"},
+                "limit": {"type": "integer", "description": "最多读多少行，默认 400"},
+            },
             "required": ["path"],
         },
     },
     {
         "name": "write_file",
-        "description": "把文本写入项目内某个文件（不存在就创建，存在则覆盖原内容）。",
+        "description": "把文本写入项目内某个文件（不存在就创建，存在则整体覆盖）。已存在的文件必须先 read_file 读过才允许覆盖。",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -96,15 +109,39 @@ TOOLS = [
     },
     {
         "name": "edit_file",
-        "description": "把文件里的一段原文替换成新文字（用于修改文件）。原文需完全匹配。",
+        "description": "把文件里的一段原文替换成新文字。原文需能唯一匹配；命中多处会报错并要求给出更长的原文。",
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "old": {"type": "string", "description": "要被替换的原文"},
+                "old": {"type": "string", "description": "要被替换的原文（建议从 read_file 的行号内容里复制）"},
                 "new": {"type": "string", "description": "替换成的新文字"},
+                "all": {"type": "boolean", "description": "为 true 时把命中的多处全部替换，默认 false"},
             },
             "required": ["path", "old", "new"],
+        },
+    },
+    {
+        "name": "multi_edit",
+        "description": "一次修改同一个文件的多处内容（原子操作：任一处失败则整批不写入）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "edits": {
+                    "type": "array",
+                    "description": "要执行的替换列表，按顺序应用",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old": {"type": "string", "description": "要替换的原文（需唯一匹配）"},
+                            "new": {"type": "string", "description": "替换成的新文字"},
+                        },
+                        "required": ["old", "new"],
+                    },
+                },
+            },
+            "required": ["path", "edits"],
         },
     },
     {
@@ -124,6 +161,7 @@ TOOLS = [
             "properties": {
                 "pattern": {"type": "string", "description": "正则表达式"},
                 "path": {"type": "string", "description": "搜索起始目录，默认项目根目录"},
+                "include": {"type": "string", "description": "只搜文件名匹配该通配符的文件，例如 *.py"},
             },
             "required": ["pattern"],
         },
@@ -241,15 +279,19 @@ def _exec(name: str, args: dict) -> str:
     if name == "run_command":
         return general.run_command(args.get("command", ""))
     if name == "read_file":
-        return general.read_file(args.get("path", ""))
+        return general.read_file(args.get("path", ""), args.get("offset", 1), args.get("limit", 400))
     if name == "write_file":
         return general.write_file(args.get("path", ""), args.get("content", ""))
     if name == "edit_file":
-        return general.edit_file(args.get("path", ""), args.get("old", ""), args.get("new", ""))
+        return general.edit_file(args.get("path", ""), args.get("old", ""),
+                                 args.get("new", ""), bool(args.get("all", False)))
+    if name == "multi_edit":
+        return general.multi_edit(args.get("path", ""), args.get("edits", []))
     if name == "list_files":
         return general.list_files(args.get("pattern", "**/*"))
     if name == "search_text":
-        return general.search_text(args.get("pattern", ""), args.get("path", "."))
+        return general.search_text(args.get("pattern", ""), args.get("path", "."),
+                                   args.get("include", ""))
     if name == "web_fetch":
         return general.web_fetch(args.get("url", ""))
     if name == "add_todo":
@@ -281,7 +323,7 @@ def run(user_text: str, history=None) -> str:
     for round_no in range(1, MAX_TOOL_ROUNDS + 1):
         resp = client.messages.create(
             model=config.DEEPSEEK_MODEL,
-            max_tokens=2048,
+            max_tokens=8192,
             system=_system_prompt(),
             tools=TOOLS,
             messages=messages,

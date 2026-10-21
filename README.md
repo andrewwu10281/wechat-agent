@@ -35,10 +35,24 @@
 
 | 通用工具 | 作用 |
 |---|---|
-| `run_command` | 在项目目录下运行一条命令行命令（可跑脚本、做计算等） |
-| `read_file` / `write_file` / `edit_file` | 读、写、改文件 |
-| `list_files` / `search_text` | 按通配符列文件 / 按正则全文检索（类 glob / grep） |
+| `run_command` | 在项目目录下运行命令行命令，回传退出码与 stderr；`timeout` 可调到最长 600 秒 |
+| `read_file` | 读文件，**返回带行号的内容**；大文件用 `offset` / `limit` 分段读（默认前 400 行） |
+| `write_file` | 整体写入/覆盖文件；**已存在的文件必须先 `read_file` 读过**才允许覆盖 |
+| `edit_file` | 改一处：精确匹配优先，不中则**忽略每行首尾空白**再匹配；命中多处会报错并列出各行号 |
+| `multi_edit` | 一次改同一个文件的多处，**原子**执行：任一处不匹配就整批不写入 |
+| `list_files` / `search_text` | 按通配符列文件 / 按正则全文检索（类 glob / grep），`search_text` 可用 `include="*.py"` 按文件名筛选 |
 | `web_fetch` | 联网抓取网页文本（可用于检索、查资料等） |
+
+### 改代码的工作流（写在 system prompt 里，强制模型遵守）
+
+1. **定位**：`search_text`（可加 `include` 筛选）
+2. **阅读**：`read_file`，大文件用 `offset` / `limit` 分段，按行号看清楚再动手
+3. **修改**：局部改动 `edit_file`；多处改动 `multi_edit`（原子）；整份重写才用 `write_file`
+4. **验证**：改完用 `run_command` 跑 `python -m compileall` 或测试脚本，把结果如实回报
+
+这套"读—改—验"的纪律，是让它在文件处理/代码任务上接近 Codex 的关键；
+配套 `test_tools.py` 覆盖了上述每个行为（`read_file` 分段、`edit_file` 模糊匹配与歧义拒绝、
+`multi_edit` 原子性、`write_file` 先读后写、`search_text` 过滤、`run_command` 退出码）。
 
 有了这套底线能力，像"算数""查天气/查资料"这类可组合的问题，模型可以**自己用
 `run_command` 跑脚本、用 `web_fetch` 联网**完成，不必预先写死成专用工具。
@@ -103,6 +117,16 @@ python -m venv .venv
 
 首次运行会弹出二维码，用手机微信「扫一扫」扫码并确认授权；登录成功后即开始接收消息。
 换号或凭证失效时用 `.venv\Scripts\python bot.py --relogin` 重新登录。
+
+### 4. 自测（不碰微信、先验大脑和工具）
+
+```bash
+# 工具层单元测试：不花 API 费用，验证读写改文件的每个行为
+.venv\Scripts\python test_tools.py
+
+# 端到端冒烟测试：会真实调用 DeepSeek，验证算数/天气/学术/通用工具
+.venv\Scripts\python smoke_test.py
+```
 
 
 ## 微信接入说明
