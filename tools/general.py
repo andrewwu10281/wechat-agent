@@ -14,16 +14,25 @@
   4. write_file 有「先读后写」保护：已存在的文件必须先 read_file 读过
      （且读过之后没被别人改过）才允许覆盖，防止盲目覆盖毁掉文件。
 
-安全说明：
-  - 这套工具能读写文件、能执行命令，威力大、风险也大。
-  - 文件操作被限制在项目目录（WORKSPACE）内。
-  - 命令执行只做了最粗的拦截，不是真正的沙箱；请只在可信、本地的环境使用，
-    不要把带 run_command 的机器人暴露给不信任的人。
+安全机制（Phase 4，"可控"比"能干"更优先）：
+  A. **路径围栏**：命令里出现的路径若解析到项目目录之外（`..`、绝对路径、`~`、`%TEMP%`），
+     一律判为越界。文件工具本来就只能在项目内，命令工具现在也受同样约束。
+  B. **危险命令确认（人机审批）**：删除/移动/git 强制重置/卸载包/taskkill 等操作默认拒绝，
+     必须由用户在对话里明确同意，模型才能带 `approve=true` 重试。
+     ——这是"给聊天机器人用的审批流"：审批发生在微信对话里，不是弹窗。
+  C. **审计日志**：每次命令、每次写文件、每次拦截都追加一行 JSON 到 `audit.log`
+     （已 gitignore），事后能查"谁在什么时候让它干了什么"。
+  D. 三档强度：环境变量 `SECURITY_MODE = strict（默认）/ warn / off`。
+
+⚠️ 诚实说明：**这不是操作系统级沙箱**。路径围栏是字符串层面的检查，`shell=True` 仍能
+通过编码技巧绕过（例如把路径拼在脚本里）。真要对外提供服务，应该把命令执行放进容器
+或受限用户，而不是只靠这些检查。
 """
 import difflib           #相似度比较，用于"没找到原文"时给出最接近的位置
 import fnmatch           #按 *.py 这类通配符筛选文件名
 import glob as _globmod  #按通配符找文件
 import itertools         #生成后台任务的自增编号
+import json              #写审计日志（JSON Lines）
 import os                #路径 / 目录 / 文件判断
 import re                #正则（检索、清洗网页）
 import subprocess        #运行命令行命令
@@ -48,6 +57,136 @@ _job_seq = itertools.count(1)   # 自增编号，生成 job1 / job2 ...
 # 记录「本进程里读过哪些文件、读的时候它的修改时间是多少」
 # 用途：write_file 的「先读后写」保护——没读过、或读过之后文件又变了，就不许覆盖。
 _observed: dict[str, float] = {}
+
+# ---------------------------------------------------------------------------
+# 安全策略：模式 / 审计 / 危险命令判定 / 路径围栏
+# ---------------------------------------------------------------------------
+# strict（默认）：越界拒绝 + 危险命令必须审批
+# warn          ：越界与危险命令只记审计、仍放行（自己机器上折腾时用）
+# off           ：完全不检查（不建议）
+SECURITY_MODE = (os.getenv("SECURITY_MODE", "strict") or "strict").strip().lower()
+if SECURITY_MODE not in ("strict", "warn", "off"):
+    SECURITY_MODE = "strict"
+
+AUDIT_FILE = os.path.join(WORKSPACE, "audit.log")
+
+# 一律拒绝：这些操作破坏性太大，不是"要不要审批"的问题
+_DENY_RX = re.compile(
+    r"rm\s+-[rf]{1,2}\s+/(\s|$|\*)"          # rm -rf /
+    r"|mkfs"                                  # 格式化
+    r"|format\s+[a-z]:"                       # format c:
+    r"|del\s+/[fsq].*\b[a-z]:\\"              # del /f /s /q c:\
+    r"|rd\s+/s\s+/q\s+[a-z]:\\"               # rd /s /q c:\
+    r"|dd\s+if="                              # 裸写磁盘
+    r"|>\s*/dev/sd"                           # 覆盖磁盘设备
+    r"|:\(\)\s*\{\s*:\|:&\s*\};:"              # fork 炸弹
+    r"|shutdown|reboot|halt\b"                # 关机/重启
+    r"|reg\s+delete\s+hklm"                   # 删注册表根
+    r"|Remove-Item\s+-Recurse\s+-Force\s+[a-z]:\\"
+    r"|chmod\s+-R\s+777\s+/(\s|$)",           # 全盘放宽权限
+    re.IGNORECASE,
+)
+
+# 需要用户明确同意（approve=true）才能执行
+_RISKY_RX = re.compile(
+    r"\brm\b|\bdel\b|\brd\b|\brmdir\b|\bRemove-Item\b|\brmtree\b"   # 删除
+    r"|\bmove\b|\bmv\b|\bMove-Item\b|\bren\b|\bRename-Item\b"        # 移动/改名
+    r"|\bgit\s+(reset\s+--hard|clean\b|push\b.*--force|checkout\s+--\s)"  # 丢改动
+    r"|\bpip\s+uninstall\b|\bnpm\s+uninstall\b"                      # 卸载
+    r"|\btaskkill\b|\bStop-Process\b"                                # 杀进程
+    r"|\bsudo\b|\brunas\b|\bchmod\b|\bchown\b|\breg\s+add\b"          # 提权/改权限
+    r"|\bsetx\b|\bnetsh\b"                                            # 改系统配置
+    r"|\b(curl|wget)\b[^|]*\|\s*(bash|sh|python)"                    # 管道执行远程脚本
+    r"|\bStart-Process\b.*-Verb\s+RunAs",                            # 提权启动
+    re.IGNORECASE,
+)
+
+
+def _audit(event: str, **fields) -> None:
+    """追加一行审计记录到 audit.log（JSON Lines）。审计失败绝不影响主流程。"""
+    try:
+        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event}
+        try:
+            from tools.context import get_current_user   # 记录"是谁让它干的"
+            rec["user"] = get_current_user()
+        except Exception:
+            pass
+        rec.update(fields)
+        with open(AUDIT_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _looks_like_path(tok: str) -> bool:
+    """粗略判断一个命令行参数像不像路径。
+
+    注意：`/q`、`-rf`、`/s` 这类是**命令行开关**，不是 Unix 绝对路径——
+    误判它们会让所有带参数的 Windows 命令（del /q、dir /s…）都被当成"越界"。
+    """
+    if not tok or len(tok) < 2:
+        return False
+    if re.match(r"^[-/][A-Za-z]{1,4}$", tok):   # 开关，如 /q、-rf、--force
+        return False
+    if tok.startswith(("~", "..", "%", "$")):
+        return True
+    if re.match(r"^[A-Za-z]:[\\/]", tok):       # C:\...
+        return True
+    if tok.startswith(("/", "\\")):
+        return True
+    return ("/" in tok or "\\" in tok)
+
+
+def _find_escapes(command: str) -> list:
+    """找出命令里解析到工作区之外的路径参数（字符串层面检查，不是真沙箱）。"""
+    hits = []
+    for raw in re.split(r"[\s\"'=;,()|&<>]+", command or ""):
+        tok = raw.strip()
+        if not _looks_like_path(tok):
+            continue
+        if tok.startswith(("http://", "https://")):
+            continue
+        # %TEMP% / $HOME / ~ 这类无法静态解析，一律按"可能越界"处理
+        if "%" in tok or tok.startswith(("$", "~")):
+            hits.append(tok)
+            continue
+        try:
+            p = os.path.abspath(tok if os.path.isabs(tok) else os.path.join(WORKSPACE, tok))
+            if os.path.commonpath([WORKSPACE, p]) != WORKSPACE:
+                hits.append(tok)
+        except Exception:
+            hits.append(tok)      # 解析不了也算可疑
+    return hits
+
+
+def _command_policy(command: str, approve: bool, cwd: str, tool: str) -> tuple:
+    """判定一条命令能不能跑。返回 (decision, reply)。
+
+    decision: "allow"（直接跑）/ "deny"（拒绝，reply 是给模型的说明）
+    """
+    if SECURITY_MODE == "off":
+        return "allow", ""
+    cmd = command or ""
+    # ① 一律拒绝的破坏性命令
+    if _DENY_RX.search(cmd):
+        _audit("blocked", tool=tool, command=cmd, reason="deny-list")
+        return "deny", ("错误：这条命令属于破坏性操作（删除/格式化/关机/改系统配置等），"
+                        "已被安全策略永久拒绝，不能通过授权绕过。请换一种安全的做法。")
+    # ② 越界路径：strict 直接拒绝
+    escapes = _find_escapes(cmd)
+    if escapes:
+        if SECURITY_MODE == "strict":
+            _audit("blocked", tool=tool, command=cmd, reason="escape", paths=escapes)
+            return "deny", (f"错误：命令里这些路径超出了项目目录，已被拒绝：{', '.join(escapes[:5])}\n"
+                            f"项目工作目录是：{WORKSPACE}。请只操作项目内的文件。")
+        _audit("warn-escape", tool=tool, command=cmd, paths=escapes)
+    # ③ 危险操作：需要用户审批
+    if _RISKY_RX.search(cmd) and not approve:
+        _audit("needs-approval", tool=tool, command=cmd)
+        return "deny", ("这条命令属于**有风险的操作**（删除/移动/强推/卸载/杀进程等），需要用户确认才能执行。\n"
+                        "请先在你的回复里向用户说明：要执行什么、会有什么后果，并请用户明确同意；\n"
+                        "用户同意后，你再带参数 approve=true 重新调用一次。在此之前不要执行。")
+    return "allow", ""
 
 
 def _within_workspace(path: str) -> str:
@@ -114,10 +253,11 @@ def reset_observed() -> None:
 # ---------------------------------------------------------------------------
 # 命令执行
 # ---------------------------------------------------------------------------
-def run_command(command: str, timeout: int = 60, cwd: str = "") -> str:
+def run_command(command: str, timeout: int = 60, cwd: str = "", approve: bool = False) -> str:
     """在项目内运行一条命令，返回结构化结果（执行状态 / 超时 / 退出码 / stdout+stderr）。
 
     输出超长时保留「头部 + 尾部」——报错通常在尾部，不能只留头部。
+    approve=True 表示用户已明确同意执行这条有风险的操作。
     """
     #去掉首尾空格；空命令直接返回错误
     command = (command or "").strip()
@@ -129,14 +269,14 @@ def run_command(command: str, timeout: int = 60, cwd: str = "") -> str:
     except Exception:
         timeout = 60
     timeout = max(1, min(timeout, 600))
-    #最粗的危险命令拦截（不是沙箱，只是防明显误操作）
-    low = command.lower()
-    if any(b in low for b in _BLOCKED):
-        return "错误：该命令被安全策略拦截。"
     try:
         workdir = _resolve_cwd(cwd)
     except ValueError as e:
         return f"错误：{e}"
+    #安全策略判定：破坏性命令拒绝、越界路径拒绝、危险操作要审批
+    decision, reply = _command_policy(command, bool(approve), workdir, "run_command")
+    if decision == "deny":
+        return reply
     try:
         #shell=True：交给系统 shell 执行；capture_output：收集输出
         r = subprocess.run(
@@ -145,10 +285,14 @@ def run_command(command: str, timeout: int = 60, cwd: str = "") -> str:
             encoding="utf-8", errors="replace",
         )
     except subprocess.TimeoutExpired:
+        _audit("command", tool="run_command", command=command, result="timeout", approved=bool(approve))
         return (f"状态：超时（>{timeout}s），命令可能仍在运行或已被终止：{command}\n"
                 f"建议：需要长时间运行的任务改用 run_background 起后台任务，再用 check_job 轮询。")
     except Exception as e:
+        _audit("command", tool="run_command", command=command, result="error", error=str(e))
         return f"状态：执行失败：{e}"
+    _audit("command", tool="run_command", command=command,
+           result="ok" if r.returncode == 0 else "failed", rc=r.returncode, approved=bool(approve))
     #把 stdout 和 stderr 分开标注，再附退出码，结构清晰便于模型判断
     parts = [f"状态：{'成功（退出码 0）' if r.returncode == 0 else f'失败（退出码 {r.returncode}）'}"]
     if r.stdout:
@@ -171,18 +315,18 @@ def _job_brief(job: dict) -> str:
     return f"{status}{rc}，已运行 {dur:.0f}s，命令：{job['command']}"
 
 
-def run_background(command: str, cwd: str = "") -> str:
+def run_background(command: str, cwd: str = "", approve: bool = False) -> str:
     """在后台启动一条命令，立刻返回任务编号；用 check_job 看进度、kill_job 终止。"""
     command = (command or "").strip()
     if not command:
         return "错误：命令为空。"
-    low = command.lower()
-    if any(b in low for b in _BLOCKED):
-        return "错误：该命令被安全策略拦截。"
     try:
         workdir = _resolve_cwd(cwd)
     except ValueError as e:
         return f"错误：{e}"
+    decision, reply = _command_policy(command, bool(approve), workdir, "run_background")
+    if decision == "deny":
+        return reply
     try:
         #stderr 合并进 stdout，保证输出顺序可读
         proc = subprocess.Popen(
@@ -216,6 +360,8 @@ def run_background(command: str, cwd: str = "") -> str:
             job["done"] = True
 
     threading.Thread(target=_reader, daemon=True).start()
+    _audit("background", tool="run_background", command=command,
+           job=jid, approved=bool(approve))
     return (f"状态：已在后台启动 {jid}\n{_job_brief(job)}\n"
             f"用 check_job(job_id=\"{jid}\") 查看进度和最新输出；用 kill_job(job_id=\"{jid}\") 终止。")
 
@@ -298,6 +444,45 @@ def list_jobs() -> str:
     if not _jobs:
         return "当前没有后台任务。"
     return "\n".join(f"- {jid}: {_job_brief(job)}" for jid, job in _jobs.items())
+
+
+def read_audit_log(limit: int = 30, event: str = "") -> str:
+    """读最近的审计记录（谁在哪一刻让它跑了什么命令 / 写了什么文件 / 被拦了什么）。"""
+    if not os.path.exists(AUDIT_FILE):
+        return "还没有审计记录（audit.log 不存在）。"
+    try:
+        limit = max(1, min(int(limit), 200))
+    except Exception:
+        limit = 30
+    want = (event or "").strip()
+    try:
+        with open(AUDIT_FILE, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return f"读取审计日志失败：{e}"
+    picked = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if want and rec.get("event") != want:
+            continue
+        picked.append(rec)
+    if not picked:
+        return f"没有匹配的审计记录（event={want or '全部'}）。"
+    out = []
+    for rec in picked[-limit:]:
+        parts = [f"{rec.get('ts','')} [{rec.get('event','')}]"]
+        for k in ("tool", "user", "command", "path", "job", "result", "rc", "reason", "approved"):
+            if rec.get(k) not in (None, "", False):
+                parts.append(f"{k}={rec[k]}")
+        out.append(" | ".join(parts))
+    head = f"（audit.log 共 {len(lines)} 行，显示最近 {len(out)} 条{('，event=' + want) if want else ''}）"
+    return head + "\n" + "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +570,7 @@ def write_file(path: str, content: str) -> str:
         with open(p, "w", encoding="utf-8") as f:
             f.write(content)
         _remember(p)   # 写完更新记录，后续操作才能继续
+        _audit("write_file", path=os.path.relpath(p, WORKSPACE), chars=len(content))
         return f"已写入 {path}（{len(content)} 字符）。"
     except Exception as e:
         return f"写入失败：{e}"
@@ -505,6 +691,7 @@ def edit_file(path: str, old: str, new: str, all: bool = False) -> str:
         with open(p, "w", encoding="utf-8") as f:
             f.write(new_text)
         _remember(p)
+        _audit("edit_file", path=os.path.relpath(p, WORKSPACE), detail=info)
         return f"已替换 {path} 中 {info}。"
     except Exception as e:
         return f"写入失败：{e}"
@@ -546,6 +733,7 @@ def multi_edit(path: str, edits) -> str:
         with open(p, "w", encoding="utf-8") as f:
             f.write(work)
         _remember(p)
+        _audit("multi_edit", path=os.path.relpath(p, WORKSPACE), edits=len(edits))
         return f"已在 {path} 中应用 {len(edits)} 处修改。"
     except Exception as e:
         return f"写入失败：{e}"

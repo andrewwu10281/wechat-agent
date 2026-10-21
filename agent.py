@@ -52,6 +52,14 @@ SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任�
   （装依赖、跑测试套件、构建）用 run_background 起后台任务，拿到 job 编号后
   用 wait_job 等它结束（推荐，一次拿到结果）；需要中途瞄一眼就趁 check_job；
   不要用 run_command 硬等长任务，也不要靠反复 check_job 空转浪费轮数。
+- 安全规则（必须遵守，不要试图绕过）：
+  - 你只能在项目目录内操作。命令里出现项目外的路径会被拒绝。
+  - 删除、移动/改名、git reset --hard、git push --force、卸载包、杀进程、改权限等
+    **危险操作**默认会被拦下。遇到这种情况：先在回复里向用户说明"要做什么、有什么后果"，
+    请用户明确同意；用户同意后，再带 approve=true 重新调用。
+  - 不要为了绕过安全策略去改写命令（例如把路径拼进脚本里、换用别的删除方式）。
+    被拒绝时如实告诉用户原因。
+  - 用户问「你刚才做了什么/有没有乱动我的文件」时，调用 read_audit_log 如实汇报。
 - 改代码/改文件时，必须遵守这个工作流，不要跳步：
   1) 定位：先用 search_text（可用 include 按 *.py 之类筛选）找到相关位置；
   2) 阅读：再用 read_file 读目标文件。默认只返回前 400 行且带行号，
@@ -223,27 +231,41 @@ def compact_history(history, summary: str = "", budget: int = HISTORY_TOKEN_BUDG
 TOOLS = [
     {
         "name": "run_command",
-        "description": "在项目内运行一条命令并等待它结束，返回状态/退出码/stdout/stderr。适合短命令（默认超时 60s）；耗时长的请用 run_background。",
+        "description": "在项目内运行一条命令并等待它结束，返回状态/退出码/stdout/stderr。适合短命令（默认超时 60s）；耗时长的请用 run_background。删除/移动等危险命令需用户同意后带 approve=true。",
         "input_schema": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "要执行的命令，例如 python -c \"print(12345*678+91)\""},
                 "timeout": {"type": "integer", "description": "超时秒数，默认 60，最大 600"},
                 "cwd": {"type": "string", "description": "工作目录（相对项目根目录），默认项目根目录"},
+                "approve": {"type": "boolean", "description": "仅当用户已在对话里明确同意执行这条危险命令时才设为 true"},
             },
             "required": ["command"],
         },
     },
     {
         "name": "run_background",
-        "description": "在后台启动命令并立刻返回任务编号，不阻塞。适合装依赖、跑测试、构建这类耗时任务。用 check_job 看进度。",
+        "description": "在后台启动命令并立刻返回任务编号，不阻塞。适合装依赖、跑测试、构建这类耗时任务。用 wait_job 看结果。",
         "input_schema": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "要后台执行的命令"},
                 "cwd": {"type": "string", "description": "工作目录（相对项目根目录），默认项目根目录"},
+                "approve": {"type": "boolean", "description": "仅当用户已明确同意执行这条危险命令时才设为 true"},
             },
             "required": ["command"],
+        },
+    },
+    {
+        "name": "read_audit_log",
+        "description": "查看审计日志：最近执行过哪些命令、写过哪些文件、哪些操作被安全策略拦下。用户问「你刚才干了什么/有没有乱动我文件」时用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "最多显示多少条，默认 30"},
+                "event": {"type": "string", "description": "只看某类事件，如 command / write_file / blocked，可空"},
+            },
+            "required": [],
         },
     },
     {
@@ -481,9 +503,12 @@ _init_mcp()
 def _exec(name: str, args: dict) -> str:
     if name == "run_command":
         return general.run_command(args.get("command", ""), args.get("timeout", 60),
-                                  args.get("cwd", ""))
+                                  args.get("cwd", ""), bool(args.get("approve", False)))
     if name == "run_background":
-        return general.run_background(args.get("command", ""), args.get("cwd", ""))
+        return general.run_background(args.get("command", ""), args.get("cwd", ""),
+                                      bool(args.get("approve", False)))
+    if name == "read_audit_log":
+        return general.read_audit_log(args.get("limit", 30), args.get("event", ""))
     if name == "check_job":
         return general.check_job(args.get("job_id", ""), args.get("tail_chars", 2000))
     if name == "wait_job":
