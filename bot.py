@@ -28,6 +28,7 @@ from urllib.parse import quote
 import requests  #发 HTTP 请求（收消息、发消息)
 from agent import run, compact_history
 from tools.context import set_current_user
+from tools.general import peek_pending_approval, arm_pending_approval, deny_pending_approval
 from tools.todos import due_reminders, mark_reminded
 
 
@@ -36,6 +37,26 @@ MAX_QR_REFRESH = 3
 MAX_HISTORY = 200
 DEBUG_MSG = os.getenv("DEBUG_MSG", "") == "1"   # 设 DEBUG_MSG=1 时打印收到的原始消息（调试群聊用）
 LOG = logging.getLogger("wechat-bot") #在模块顶层创建，文件里所有函数都能直接引用LOG
+
+# 审批用词表：用户回复这些词视为"同意执行刚才那条危险命令"
+_NEGATIVE = ("不要", "不用", "取消", "算了", "拒绝", "别", "不同意", "不是", "no", "cancel", "n")
+_AFFIRMATIVE = {"同意", "可以", "确认", "确定", "批准", "好的", "好", "行", "执行吧", "干吧",
+                "yes", "ok", "approve", "y", "嗯"}
+
+
+def _is_negative(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return any(k in t for k in _NEGATIVE)
+
+
+def _is_affirmative(text: str) -> bool:
+    """判断用户是不是在同意执行刚被拦下的危险命令（否定优先，避免"不同意"被当成同意）。"""
+    t = (text or "").strip().lower().rstrip("。.!！~ ")
+    if not t or _is_negative(t):
+        return False
+    if t in _AFFIRMATIVE:
+        return True
+    return any(k in t for k in ("同意", "确认", "批准"))
 
 
 
@@ -421,6 +442,22 @@ def _handle_msg(sess: dict, msg: dict, context_tokens: dict,
     #告诉待办工具"当前是谁"，保证每个人只读写自己的待办
     set_current_user(from_user)
 
+    #审批流：如果上一条危险命令还在等确认，看这次回复是不是"同意/拒绝"
+    pending = peek_pending_approval()
+    if pending:
+        if _is_affirmative(text):
+            cmd = arm_pending_approval()
+            LOG.info("用户已批准执行：%s", cmd)
+            text = f"用户已经明确同意执行这条命令，请立刻执行：{cmd}"
+        elif _is_negative(text):
+            deny_pending_approval()
+            LOG.info("用户拒绝执行待确认命令")
+            text = "用户拒绝执行刚才那条有风险的操作，请不要再尝试，并说明已经取消。"
+        else:
+            # 用户说的是别的：当作放弃那条待确认命令，避免"以后某句话意外变成同意"
+            deny_pending_approval()
+            LOG.info("用户没答复审批，已清除待确认命令")
+
     #调 agent：先按 token 预算压缩历史（超预算把早期对话压成摘要），再带上历史 + 摘要
     state = histories.get(from_user) or {"messages": [], "summary": ""}
     try:
@@ -436,6 +473,10 @@ def _handle_msg(sess: dict, msg: dict, context_tokens: dict,
             {"role": "assistant", "content": [{"type": "text", "text": answer}]},
         ]
         histories[from_user] = {"messages": msgs[-MAX_HISTORY:], "summary": summary}
+
+    #如果这轮模型又提出了危险操作，明确提示用户需要确认
+    if peek_pending_approval():
+        answer += "\n\n⚠️ 这条操作有风险，需要你确认：回复「同意」我就执行，回复其他内容视为取消。"
 
     send_text(sess, from_user, answer, ctx or context_tokens.get(from_user, ""))
     LOG.info("已回复 %s", from_user)

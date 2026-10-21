@@ -55,9 +55,10 @@ SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任�
 - 安全规则（必须遵守，不要试图绕过）：
   - 你只能在项目目录内操作。命令里出现项目外的路径会被拒绝。
   - 删除、移动/改名、git reset --hard、git push --force、卸载包、杀进程、改权限等
-    **危险操作**默认会被拦下。遇到这种情况：先在回复里向用户说明"要做什么、有什么后果"，
-    请用户明确同意；用户同意后，再带 approve=true 重新调用。
-  - 不要为了绕过安全策略去改写命令（例如把路径拼进脚本里、换用别的删除方式）。
+    **危险操作**会被拦下。**审批权在用户手里，你没有办法自己批准**：
+    遇到这种情况，请在回复里向用户说明"要做什么、有什么后果"，并请用户确认；
+    用户确认后由系统放行，你再说一次同样的事情即可（系统已记住这条命令）。
+  - 不要为了绕过安全策略去改写命令（改路径写法、换删除方式、拼进脚本里都不行）。
     被拒绝时如实告诉用户原因。
   - 用户问「你刚才做了什么/有没有乱动我的文件」时，调用 read_audit_log 如实汇报。
 - 改代码/改文件时，必须遵守这个工作流，不要跳步：
@@ -238,7 +239,6 @@ TOOLS = [
                 "command": {"type": "string", "description": "要执行的命令，例如 python -c \"print(12345*678+91)\""},
                 "timeout": {"type": "integer", "description": "超时秒数，默认 60，最大 600"},
                 "cwd": {"type": "string", "description": "工作目录（相对项目根目录），默认项目根目录"},
-                "approve": {"type": "boolean", "description": "仅当用户已在对话里明确同意执行这条危险命令时才设为 true"},
             },
             "required": ["command"],
         },
@@ -251,7 +251,6 @@ TOOLS = [
             "properties": {
                 "command": {"type": "string", "description": "要后台执行的命令"},
                 "cwd": {"type": "string", "description": "工作目录（相对项目根目录），默认项目根目录"},
-                "approve": {"type": "boolean", "description": "仅当用户已明确同意执行这条危险命令时才设为 true"},
             },
             "required": ["command"],
         },
@@ -503,10 +502,9 @@ _init_mcp()
 def _exec(name: str, args: dict) -> str:
     if name == "run_command":
         return general.run_command(args.get("command", ""), args.get("timeout", 60),
-                                  args.get("cwd", ""), bool(args.get("approve", False)))
+                                  args.get("cwd", ""))
     if name == "run_background":
-        return general.run_background(args.get("command", ""), args.get("cwd", ""),
-                                      bool(args.get("approve", False)))
+        return general.run_background(args.get("command", ""), args.get("cwd", ""))
     if name == "read_audit_log":
         return general.read_audit_log(args.get("limit", 30), args.get("event", ""))
     if name == "check_job":

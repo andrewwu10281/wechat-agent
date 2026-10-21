@@ -57,18 +57,41 @@ def main() -> int:
             r = general.run_command(cmd)
             check(f"{label} 被拒绝", r.startswith("错误") and "永久拒绝" in r, r[:100])
 
-        print("\n== 3. 危险操作：需要用户审批 ==")
+        print("\n== 3. 危险操作：批准权在外壳，模型无权自行批准 ==")
         target = "_tmp_sec_test/doomed.txt"
         target_cmd = target.replace("/", "\\")      # Windows 的 del 只认反斜杠
         with open(os.path.join(BASE, target), "w", encoding="utf-8") as f:
             f.write("x")
         r = general.run_command(f'del /q "{target_cmd}"')
-        check("未审批时被拦下", "需要用户确认" in r, r[:150])
-        check("说明里要求问用户", "向用户说明" in r or "明确同意" in r, r[:200])
+        check("未审批时被拦下", "有风险的操作" in r, r[:150])
+        pend = general.peek_pending_approval()
+        check("拦下后进入待确认队列", pend is not None and pend.get("command"), pend)
         check("文件还在（没被执行）", os.path.exists(os.path.join(BASE, target)))
-        r = general.run_command(f'del /q "{target_cmd}"', approve=True)
-        check("审批后不再拦", "需要用户确认" not in r, r[:150])
-        check("审批后文件被删掉", not os.path.exists(os.path.join(BASE, target)), r[:150])
+        # 关键：模型拿不到"批准"这个工具
+        import agent as _agent
+        names = [t["name"] for t in _agent.TOOLS]
+        check("工具菜单里没有批准工具", not any("approve" in n or "arm" in n for n in names), names)
+        check("run_command 没有 approve 参数",
+              "approve" not in __import__("inspect").signature(general.run_command).parameters)
+        # 外壳（bot.py 这一层）才批准
+        cmd = general.arm_pending_approval()
+        check("外壳批准后拿到那条命令", bool(cmd) and "del" in cmd, cmd)
+        r = general.run_command(f'del /q "{target_cmd}"')
+        check("批准后放行", "有风险的操作" not in r, r[:150])
+        check("文件被删掉", not os.path.exists(os.path.join(BASE, target)), r[:150])
+        r = general.run_command(f'del /q "{target_cmd}"')
+        check("批准是一次性的（同样命令又被拦）", "有风险的操作" in r, r[:150])
+
+        print("\n== 3b. 拒绝 / 换命令绕过 ==")
+        general.run_command('del /q "a.txt"')
+        check("危险命令会登记待确认", general.peek_pending_approval() is not None)
+        general.deny_pending_approval()
+        check("拒绝后清空待确认", general.peek_pending_approval() is None)
+        general.run_command('del /q "a.txt"')
+        general.arm_pending_approval()                 # 只批准 "a.txt" 这一条
+        r = general.run_command('del /q "完全不同的命令.txt"')
+        check("指纹不同不放行（批准只对原命令）", "有风险的操作" in r, r[:150])
+        general.deny_pending_approval()
 
         print("\n== 4. 路径围栏：命令不能跳出项目目录 ==")
         for cmd, label in [("python ..\\outside.py", "..\\ 越界"),
@@ -93,13 +116,15 @@ def main() -> int:
         check("off 模式不拦危险操作", "需要用户确认" not in r, r[:100])
         general.SECURITY_MODE = "strict"
         r = general.run_command('del /q no_such_file.txt')
-        check("切回 strict 又拦住了", "需要用户确认" in r, r[:100])
+        check("切回 strict 又拦住了", "有风险的操作" in r, r[:100])
+        general.deny_pending_approval()
 
         print("\n== 7. 后台命令也受同样约束 ==")
         r = general.run_background("rm -rf /")
         check("后台破坏性命令被拒绝", "永久拒绝" in r, r[:100])
         r = general.run_background('del /q "x.txt"')
-        check("后台危险操作要审批", "需要用户确认" in r, r[:120])
+        check("后台危险操作要审批", "有风险的操作" in r, r[:120])
+        general.deny_pending_approval()
         r = general.run_background('python -c "import time; time.sleep(0.1)"')
         check("后台正常命令可启动", "已在后台启动" in r, r[:120])
 
@@ -124,6 +149,17 @@ def main() -> int:
         r = general.read_audit_log(10, "blocked")
         check("read_audit_log 可按事件过滤", "blocked" in r, r[:160])
         check("过滤生效（不含 write_file）", "write_file" not in r, r[:160])
+
+        print("\n== 9. 外壳的'同意/拒绝'识别（bot.py）==")
+        import bot
+        for t in ["同意", "可以", "确认", "好的", "嗯", "执行吧"]:
+            check(f"{t!r} 判为同意", bot._is_affirmative(t) is True, t)
+        for t in ["不同意", "不要", "取消", "算了", "拒绝"]:
+            check(f"{t!r} 判为拒绝", bot._is_affirmative(t) is False, t)
+        check("否定优先（不同意≠同意）", bot._is_affirmative("不同意") is False)
+        check("普通提问不算同意", bot._is_affirmative("帮我查下天气") is False)
+        check("空串不算同意", bot._is_affirmative("") is False)
+        check("同意词能被拒绝识别", bot._is_negative("取消") is True)
     finally:
         general.AUDIT_FILE = orig_audit
         general.SECURITY_MODE = orig_mode

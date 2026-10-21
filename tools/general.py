@@ -17,9 +17,10 @@
 安全机制（Phase 4，"可控"比"能干"更优先）：
   A. **路径围栏**：命令里出现的路径若解析到项目目录之外（`..`、绝对路径、`~`、`%TEMP%`），
      一律判为越界。文件工具本来就只能在项目内，命令工具现在也受同样约束。
-  B. **危险命令确认（人机审批）**：删除/移动/git 强制重置/卸载包/taskkill 等操作默认拒绝，
-     必须由用户在对话里明确同意，模型才能带 `approve=true` 重试。
-     ——这是"给聊天机器人用的审批流"：审批发生在微信对话里，不是弹窗。
+  B. **危险命令确认（人机审批）**：删除/移动/git 强制重置/卸载包/taskkill 等操作默认拒绝。
+     **批准权在外壳（bot.py），模型无法自行批准**——模型只能在回复里向用户说明并请示，
+     用户同意后由 bot.py 调 `arm_pending_approval()` 放行那一条命令（一次性、指纹绑定）。
+     ——这是"给聊天机器人用的审批流"：审批发生在微信对话里，不是弹窗，也不是模型自己说了算。
   C. **审计日志**：每次命令、每次写文件、每次拦截都追加一行 JSON 到 `audit.log`
      （已 gitignore），事后能查"谁在什么时候让它干了什么"。
   D. 三档强度：环境变量 `SECURITY_MODE = strict（默认）/ warn / off`。
@@ -31,6 +32,7 @@
 import difflib           #相似度比较，用于"没找到原文"时给出最接近的位置
 import fnmatch           #按 *.py 这类通配符筛选文件名
 import glob as _globmod  #按通配符找文件
+import hashlib           #命令指纹：审批只对"同一条命令"有效
 import itertools         #生成后台任务的自增编号
 import json              #写审计日志（JSON Lines）
 import os                #路径 / 目录 / 文件判断
@@ -70,6 +72,12 @@ if SECURITY_MODE not in ("strict", "warn", "off"):
 
 AUDIT_FILE = os.path.join(WORKSPACE, "audit.log")
 
+# 人机审批状态：**批准权在外壳（bot.py），不在模型**。
+# 模型无法调用 arm_pending_approval()——工具菜单里没有这个工具，它只能"提出请求"。
+APPROVAL_TTL = 300       # 待确认 / 已批准 的有效期（秒）
+_pending: dict = {}      # 正在等用户确认的那条危险命令
+_armed: dict = {}        # 用户已批准的那条命令（一次性，绑定命令指纹）
+
 # 一律拒绝：这些操作破坏性太大，不是"要不要审批"的问题
 _DENY_RX = re.compile(
     r"rm\s+-[rf]{1,2}\s+/(\s|$|\*)"          # rm -rf /
@@ -87,7 +95,7 @@ _DENY_RX = re.compile(
     re.IGNORECASE,
 )
 
-# 需要用户明确同意（approve=true）才能执行
+# 危险操作：需要外壳（bot.py）在用户确认后放行，模型无权自行批准
 _RISKY_RX = re.compile(
     r"\brm\b|\bdel\b|\brd\b|\brmdir\b|\bRemove-Item\b|\brmtree\b"   # 删除
     r"|\bmove\b|\bmv\b|\bMove-Item\b|\bren\b|\bRename-Item\b"        # 移动/改名
@@ -159,10 +167,53 @@ def _find_escapes(command: str) -> list:
     return hits
 
 
-def _command_policy(command: str, approve: bool, cwd: str, tool: str) -> tuple:
+def _sig(command: str) -> str:
+    """命令指纹：审批只对"同一条命令"有效，换了命令立刻失效。"""
+    return hashlib.sha256((command or "").strip().encode("utf-8")).hexdigest()[:16]
+
+
+def peek_pending_approval():
+    """供外壳（bot.py）查询：有没有一条正在等用户确认的危险命令。"""
+    if not _pending:
+        return None
+    if time.time() - _pending.get("ts", 0) > APPROVAL_TTL:
+        _pending.clear()
+        return None
+    return dict(_pending)
+
+
+def arm_pending_approval():
+    """外壳在"用户已明确同意"之后调用：放行那一条命令（一次性、指纹绑定）。
+
+    ⚠️ 这个函数**没有对应的工具**，模型无法调用它 —— 这是"审批权在人类一侧"的技术保证。
+    """
+    p = peek_pending_approval()
+    if not p:
+        return None
+    _armed.clear()
+    _armed.update({"sig": p["sig"], "expires": time.time() + APPROVAL_TTL})
+    _pending.clear()
+    _audit("approval-granted", command=p.get("command"), tool=p.get("tool"))
+    return p.get("command")
+
+
+def deny_pending_approval():
+    """外壳在"用户拒绝"之后调用：清掉待确认命令，不留后门。"""
+    p = peek_pending_approval()
+    _pending.clear()
+    _armed.clear()
+    if p:
+        _audit("approval-denied", command=p.get("command"), tool=p.get("tool"))
+    return bool(p)
+
+
+def _command_policy(command: str, cwd: str, tool: str) -> tuple:
     """判定一条命令能不能跑。返回 (decision, reply)。
 
     decision: "allow"（直接跑）/ "deny"（拒绝，reply 是给模型的说明）
+
+    危险操作的批准权**不在模型手里**：只有外壳调过 arm_pending_approval()，
+    且命令指纹一致，才放行一次。
     """
     if SECURITY_MODE == "off":
         return "allow", ""
@@ -180,12 +231,22 @@ def _command_policy(command: str, approve: bool, cwd: str, tool: str) -> tuple:
             return "deny", (f"错误：命令里这些路径超出了项目目录，已被拒绝：{', '.join(escapes[:5])}\n"
                             f"项目工作目录是：{WORKSPACE}。请只操作项目内的文件。")
         _audit("warn-escape", tool=tool, command=cmd, paths=escapes)
-    # ③ 危险操作：需要用户审批
-    if _RISKY_RX.search(cmd) and not approve:
+    # ③ 危险操作
+    if _RISKY_RX.search(cmd):
+        if SECURITY_MODE == "warn":
+            _audit("risky-allowed", tool=tool, command=cmd, reason="warn-mode")
+            return "allow", ""
+        if _armed and _armed.get("sig") == _sig(cmd) and time.time() < _armed.get("expires", 0):
+            _armed.clear()                      # 一次性，用过立刻失效
+            _audit("command-approved", tool=tool, command=cmd)
+            return "allow", ""
+        _pending.clear()
+        _pending.update({"sig": _sig(cmd), "command": cmd, "tool": tool, "ts": time.time()})
         _audit("needs-approval", tool=tool, command=cmd)
-        return "deny", ("这条命令属于**有风险的操作**（删除/移动/强推/卸载/杀进程等），需要用户确认才能执行。\n"
-                        "请先在你的回复里向用户说明：要执行什么、会有什么后果，并请用户明确同意；\n"
-                        "用户同意后，你再带参数 approve=true 重新调用一次。在此之前不要执行。")
+        return "deny", ("这条命令属于**有风险的操作**（删除/移动/强推/卸载/杀进程等），已被拦下，"
+                        "并且已经上报给用户确认。\n"
+                        "请在回复里告诉用户：要做什么、会有什么后果，请用户确认。\n"
+                        "**不要重复调用这条命令，也不要换用别的命令绕过审批。**")
     return "allow", ""
 
 
@@ -253,11 +314,11 @@ def reset_observed() -> None:
 # ---------------------------------------------------------------------------
 # 命令执行
 # ---------------------------------------------------------------------------
-def run_command(command: str, timeout: int = 60, cwd: str = "", approve: bool = False) -> str:
+def run_command(command: str, timeout: int = 60, cwd: str = "") -> str:
     """在项目内运行一条命令，返回结构化结果（执行状态 / 超时 / 退出码 / stdout+stderr）。
 
     输出超长时保留「头部 + 尾部」——报错通常在尾部，不能只留头部。
-    approve=True 表示用户已明确同意执行这条有风险的操作。
+    危险操作的批准权在外壳（bot.py 调 arm_pending_approval），模型无权自行批准。
     """
     #去掉首尾空格；空命令直接返回错误
     command = (command or "").strip()
@@ -274,7 +335,7 @@ def run_command(command: str, timeout: int = 60, cwd: str = "", approve: bool = 
     except ValueError as e:
         return f"错误：{e}"
     #安全策略判定：破坏性命令拒绝、越界路径拒绝、危险操作要审批
-    decision, reply = _command_policy(command, bool(approve), workdir, "run_command")
+    decision, reply = _command_policy(command, workdir, "run_command")
     if decision == "deny":
         return reply
     try:
@@ -285,14 +346,14 @@ def run_command(command: str, timeout: int = 60, cwd: str = "", approve: bool = 
             encoding="utf-8", errors="replace",
         )
     except subprocess.TimeoutExpired:
-        _audit("command", tool="run_command", command=command, result="timeout", approved=bool(approve))
+        _audit("command", tool="run_command", command=command, result="timeout")
         return (f"状态：超时（>{timeout}s），命令可能仍在运行或已被终止：{command}\n"
                 f"建议：需要长时间运行的任务改用 run_background 起后台任务，再用 check_job 轮询。")
     except Exception as e:
         _audit("command", tool="run_command", command=command, result="error", error=str(e))
         return f"状态：执行失败：{e}"
     _audit("command", tool="run_command", command=command,
-           result="ok" if r.returncode == 0 else "failed", rc=r.returncode, approved=bool(approve))
+           result="ok" if r.returncode == 0 else "failed", rc=r.returncode)
     #把 stdout 和 stderr 分开标注，再附退出码，结构清晰便于模型判断
     parts = [f"状态：{'成功（退出码 0）' if r.returncode == 0 else f'失败（退出码 {r.returncode}）'}"]
     if r.stdout:
@@ -315,7 +376,7 @@ def _job_brief(job: dict) -> str:
     return f"{status}{rc}，已运行 {dur:.0f}s，命令：{job['command']}"
 
 
-def run_background(command: str, cwd: str = "", approve: bool = False) -> str:
+def run_background(command: str, cwd: str = "") -> str:
     """在后台启动一条命令，立刻返回任务编号；用 check_job 看进度、kill_job 终止。"""
     command = (command or "").strip()
     if not command:
@@ -324,7 +385,7 @@ def run_background(command: str, cwd: str = "", approve: bool = False) -> str:
         workdir = _resolve_cwd(cwd)
     except ValueError as e:
         return f"错误：{e}"
-    decision, reply = _command_policy(command, bool(approve), workdir, "run_background")
+    decision, reply = _command_policy(command, workdir, "run_background")
     if decision == "deny":
         return reply
     try:
@@ -360,8 +421,7 @@ def run_background(command: str, cwd: str = "", approve: bool = False) -> str:
             job["done"] = True
 
     threading.Thread(target=_reader, daemon=True).start()
-    _audit("background", tool="run_background", command=command,
-           job=jid, approved=bool(approve))
+    _audit("background", tool="run_background", command=command, job=jid)
     return (f"状态：已在后台启动 {jid}\n{_job_brief(job)}\n"
             f"用 check_job(job_id=\"{jid}\") 查看进度和最新输出；用 kill_job(job_id=\"{jid}\") 终止。")
 
