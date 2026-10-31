@@ -204,6 +204,22 @@ def main() -> int:
     check("wait_job 超时会说仍在运行", "还没结束" in r or "仍在运行" in r, r[:150])
     general.kill_job(jid4)
 
+    print("\n== 8. web_search 参数校验（不依赖网络）==")
+    r = general.web_search("")
+    check("空关键词有提示", "关键词为空" in r, r[:80])
+    r = general.web_search(None)
+    check("None 也不会崩", "关键词为空" in r, r[:80])
+    # 解析器离线自测：用一段固定的 Bing 结果 HTML，确认能抽出标题/网址/摘要
+    fake_html = (
+        '<li class="b_algo"><h2><a href="https://example.com/a">标题 A</a></h2>'
+        "<p>摘要 A</p></li>"
+        '<li class="b_algo"><h2><a href="https://example.com/b">标题 B &amp; 更多</a></h2></li>'
+    )
+    parsed = general._parse_bing_html(fake_html, 5)
+    check("解析器能抽出 2 条", len(parsed) == 2, parsed)
+    check("解析器保留网址", parsed[0]["url"] == "https://example.com/a", parsed[0])
+    check("解析器还原转义字符", parsed[1]["title"] == "标题 B & 更多", parsed[1])
+
     shutil.rmtree(TMP, ignore_errors=True)
     general.reset_observed()
 

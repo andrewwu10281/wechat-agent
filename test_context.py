@@ -159,6 +159,40 @@ def main() -> int:
     finally:
         agent.client, agent.time.sleep, agent.MAX_LLM_RETRIES = orig_client, orig_sleep, orig_retries
 
+    print("\n== 8. 空回复兜底（微信端不能发空消息）==")
+
+    class _Block:
+        def __init__(self, kind, text=""):
+            self.type, self.text = kind, text
+
+    class _Resp:
+        def __init__(self, blocks):
+            self.content = blocks
+
+    class _FakeMsgClient:
+        """只回一个固定 content 的假客户端。"""
+        def __init__(self, blocks):
+            self._blocks = blocks
+            self.messages = self
+
+        def create(self, **kwargs):
+            return _Resp(self._blocks)
+
+    orig = agent.client
+    try:
+        agent.client = _FakeMsgClient([_Block("text", "   ")])
+        ans = agent.run("你好")
+        check("只有空白文本时不发空消息", ans.strip() != "", repr(ans))
+        check("空白文本走兜底文案", ans == agent.EMPTY_ANSWER, repr(ans))
+
+        agent.client = _FakeMsgClient([])
+        check("完全没有 text 块也走兜底", agent.run("你好") == agent.EMPTY_ANSWER)
+
+        agent.client = _FakeMsgClient([_Block("text", "  正常回答  ")])
+        check("正常回答原样返回（去掉首尾空白）", agent.run("你好") == "正常回答")
+    finally:
+        agent.client = orig
+
     print("\n" + "=" * 46)
     print(f"通过 {_passed} 项，失败 {_failed} 项")
     print("=" * 46)

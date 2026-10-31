@@ -44,6 +44,7 @@
 | `edit_file` | 改一处：精确匹配优先，不中则**忽略每行首尾空白**再匹配；命中多处会报错并列出各行号 |
 | `multi_edit` | 一次改同一个文件的多处，**原子**执行：任一处不匹配就整批不写入 |
 | `list_files` / `search_text` | 按通配符列文件 / 按正则全文检索（类 glob / grep），`search_text` 可用 `include="*.py"` 按文件名筛选 |
+| `web_search` | **联网搜索**关键词，返回标题 / 网址 / 摘要（Bing 优先、DuckDuckGo 兜底）；拿到网址再用 `web_fetch` 读正文 |
 | `web_fetch` | 联网抓取网页文本（可用于检索、查资料等） |
 
 **超长输出保留「头部 + 尾部」**：命令的报错通常在末尾，只砍尾部会把最有用的信息丢掉。
@@ -59,10 +60,10 @@
 这套"读—改—验"的纪律，是让它在文件处理/代码任务上接近 Codex 的关键；
 配套 `test_tools.py` 覆盖了上述每个行为（`read_file` 分段、`edit_file` 模糊匹配与歧义拒绝、
 `multi_edit` 原子性、`write_file` 先读后写、`search_text` 过滤、`run_command` 结构化结果与 cwd、
-后台任务的启动/等待/终止），共 **47 项**。
+后台任务的启动/等待/终止、`web_search` 参数与解析器），共 **52 项**。
 
 有了这套底线能力，像"算数""查天气/查资料"这类可组合的问题，模型可以**自己用
-`run_command` 跑脚本、用 `web_fetch` 联网**完成，不必预先写死成专用工具。
+`run_command` 跑脚本、用 `web_search` 找网址、用 `web_fetch` 读正文**完成，不必预先写死成专用工具。
 
 ## 安全机制（企业级可控）
 
@@ -73,6 +74,7 @@
 | **路径围栏** | 命令里出现项目外的路径（`..`、`C:\`、`~`、`%TEMP%`）→ 直接拒绝。文件工具本来就只能在项目内 |
 | **破坏性命令永久拒绝** | `rm -rf /`、`mkfs`、`format c:`、`shutdown`、删注册表根等 → 不可通过授权绕过 |
 | **危险操作需人工审批** | 删除/移动改名/`git reset --hard`/`git push --force`/卸载包/杀进程/改权限 → 先拦下并把这条命令登记为"待确认"；**批准权在 `bot.py` 这一层，模型没有对应工具、无法自行批准**。你在微信里回复"同意"，命令才被放行一次（且绑定命令指纹，换命令无效） |
+| **换个写法也绕不过** | 判定不只看命令字面：真正执行的是不是 `del` / `copy` / `xcopy` / `robocopy`，以及 `python -c "…"` 里有没有 `os.remove` / `Path.unlink` / `open(…,'w')` / `shutil.copy` 这类等价调用，都会纳入审批 |
 | **审计日志** | 每次命令、写文件、拦截、待确认、批准/拒绝都追加一行 JSON 到 `audit.log`（已 gitignore）；可问"你刚才干了什么"（`read_audit_log`） |
 
 **审批发生在微信对话里**（不是弹窗、也不是模型自己说了算）：模型会说"我要删 X，会有什么后果，你同意吗"，你回"可以"它才执行。
@@ -107,7 +109,7 @@
 想接自己的 MCP 服务器，在 `.env` 里加一行 `MCP_SERVER_CMD=python 路径\你的服务器.py`；
 不设置时默认加载内置示例服务器。
 
-安装依赖：`.venv\Scripts\pip install mcp`（国内可加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`）。
+安装依赖：`.venv\Scripts\python.exe -m pip install mcp`（国内可加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`）。
 
 ## 环境要求
 
@@ -119,8 +121,11 @@
 
 ```bash
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+> 用 `python.exe -m pip` 而不是 `pip.exe`：虚拟环境里的 `pip.exe` 这类启动器写死了创建时的解释器绝对路径，
+> 项目目录搬过家之后它会失效（`python -m pip` 永远用当前解释器，不受影响）。
 
 ### 2. 配置 `.env`
 
@@ -156,11 +161,15 @@ python -m venv .venv
   并放进 system prompt，因此聊很久也不会"失忆"；能理解「刚才那个」这类指代。
 - 同一条消息重复投递会被去重，只回复一次；并忽略自己发出的消息，避免自回复。
 - 工具调用最多 20 轮；同一工具 + 同一参数重复太多次会被拦截，防止死循环。
+- **空回复兜底**：模型只返回空白（或干脆没有文本）时，会用一句人话兜底，绝不给你发空消息
+  （微信端空白消息既没意义，也容易触发风控）。
 - 调试群消息：设置环境变量 `DEBUG_MSG=1` 后启动 bot，会把收到的每条原始消息打印到日志，
   方便观察群聊字段结构（仅本地调试用；日志含消息内容，勿外传）。
 
 ## 风险提示
 
 - 查学者信息走 Semantic Scholar 免费 API，免代理、国内可直连；免费额度偶尔会限流（429），模型遇到失败会自行重试。
+- `web_search` 走 Bing（国内可直连）与 DuckDuckGo（境外更稳），解析的是搜索结果页 HTML：
+  页面改版可能导致解析不到结果，此时会**如实报"搜索不可用"**，不会编造内容。
 - 通用工具（尤其 `run_command`）权限较大，请只在可信环境使用。
 - 建议用小号测试，控制发送频率。

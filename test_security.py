@@ -93,6 +93,52 @@ def main() -> int:
         check("指纹不同不放行（批准只对原命令）", "有风险的操作" in r, r[:150])
         general.deny_pending_approval()
 
+        print("\n== 3c. 结构化判定：换个 API 名字绕不过审批 ==")
+        # 背景：旧判定只看命令字面，`python -c "import os; os.remove(...)"` 会被直接放行（实测出来的洞）。
+        # 现在按"真正执行的命令名 + 内联脚本里的 API"判定。
+        bypass_cases = [
+            ('python -c "import os; os.remove(\'a.txt\')"', "os.remove"),
+            ('python -c "from pathlib import Path; Path(\'a\').unlink()"', "Path.unlink"),
+            ('python -c "open(\'f\',\'w\').write(\'\')"', "open(...,'w')"),
+            ('python -c "import shutil; shutil.copy(\'a\',\'b\')"', "shutil.copy"),
+            ('python -c "import os; os.system(\'del a.txt\')"', "os.system"),
+            ('python -c "from pathlib import Path; Path(\'a\').write_text(\'x\')"', "Path.write_text"),
+            ("copy a.txt b.txt", "copy"),
+            ("xcopy /s a b", "xcopy"),
+            ("robocopy a b /MIR", "robocopy"),
+            ("cmd /c del a.txt", "cmd /c del"),
+            ("powershell -c Copy-Item a b", "Copy-Item"),
+        ]
+        for cmd, label in bypass_cases:
+            decision, reply = general._command_policy(cmd, general.WORKSPACE, "run_command")
+            check(f"{label} 现在也要审批", decision == "deny" and "有风险的操作" in reply, reply[:100])
+            pending = general.peek_pending_approval()
+            check(f"{label} 登记了拦截原因", bool(pending and pending.get("reason")), pending)
+            general.deny_pending_approval()
+
+        safe_cases = [
+            ('python -c "print(6*7)"', "纯计算"),
+            ('python -c "print(open(\'README.md\').read()[:5])"', "只读打开文件"),
+            ('python -c "print(\'a-b\'.replace(\'-\',\'+\'))"', "字符串 replace"),
+            ('python -m compileall tools/general.py', "编译检查"),
+            ("git status", "git 只读"),
+            ("pip install requests", "装包"),
+        ]
+        for cmd, label in safe_cases:
+            decision, _ = general._command_policy(cmd, general.WORKSPACE, "run_command")
+            check(f"{label} 不被误伤", decision == "allow", cmd)
+            general._pending.clear()
+
+        # 结构化判定命中的命令：批准后同样只放行一次 → 再执行又被拦
+        target = 'python -c "import os; os.remove(\'x.txt\')"'
+        general._command_policy(target, general.WORKSPACE, "run_command")
+        general.arm_pending_approval()
+        decision, _ = general._command_policy(target, general.WORKSPACE, "run_command")
+        check("结构化判定命中后，批准可放行一次", decision == "allow", decision)
+        decision, _ = general._command_policy(target, general.WORKSPACE, "run_command")
+        check("同一条命令再执行又被拦", decision == "deny", decision)
+        general.deny_pending_approval()
+
         print("\n== 4. 路径围栏：命令不能跳出项目目录 ==")
         for cmd, label in [("python ..\\outside.py", "..\\ 越界"),
                           ("type C:\\Windows\\win.ini", "绝对路径 C:\\"),

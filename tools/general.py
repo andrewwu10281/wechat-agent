@@ -21,6 +21,9 @@
      **批准权在外壳（bot.py），模型无法自行批准**——模型只能在回复里向用户说明并请示，
      用户同意后由 bot.py 调 `arm_pending_approval()` 放行那一条命令（一次性、指纹绑定）。
      ——这是"给聊天机器人用的审批流"：审批发生在微信对话里，不是弹窗，也不是模型自己说了算。
+     **判定不只看命令字面**（`_risky_reason()`）：还会看真正执行的是不是 del / copy / robocopy 这类命令，
+     以及 `python -c "..."` 里有没有 `os.remove` / `Path.unlink` / `open(...,'w')` / `shutil.*`
+     这类等价于删除、移动、覆盖的调用——否则换个 API 名字就把审批绕过去了（这是实测出来的洞）。
   C. **审计日志**：每次命令、每次写文件、每次拦截都追加一行 JSON 到 `audit.log`
      （已 gitignore），事后能查"谁在什么时候让它干了什么"。
   D. 三档强度：环境变量 `SECURITY_MODE = strict（默认）/ warn / off`。
@@ -33,13 +36,16 @@ import difflib           #相似度比较，用于"没找到原文"时给出最�
 import fnmatch           #按 *.py 这类通配符筛选文件名
 import glob as _globmod  #按通配符找文件
 import hashlib           #命令指纹：审批只对"同一条命令"有效
+import html as _html     #搜索结果里的 &amp; 之类要还原
 import itertools         #生成后台任务的自增编号
 import json              #写审计日志（JSON Lines）
 import os                #路径 / 目录 / 文件判断
 import re                #正则（检索、清洗网页）
+import shlex             #把命令切成词，判断 argv[0] 是不是删除类命令
 import subprocess        #运行命令行命令
 import threading         #后台任务的输出读取线程
 import time              #记录任务耗时
+from urllib.parse import unquote   #DuckDuckGo 的结果链接是跳转包装，要拆出真实网址
 
 import requests          #发 HTTP 请求，抓网页
 
@@ -108,6 +114,81 @@ _RISKY_RX = re.compile(
     r"|\bStart-Process\b.*-Verb\s+RunAs",                            # 提权启动
     re.IGNORECASE,
 )
+
+# 命令名本身就是"删除 / 移动 / 覆盖"的程序（按 argv[0] 判断）。
+# 用 argv[0] 而不是全文匹配，是为了不误伤 `python copy.py` 这种文件名。
+_RISKY_BIN = {
+    "del", "erase", "rd", "rmdir", "rm", "mv", "move", "ren", "rename",
+    "copy", "xcopy", "robocopy", "mklink", "attrib", "icacls", "cacls", "takeown",
+    "format", "diskpart", "taskkill", "pkill", "kill", "chmod", "chown",
+    "copy-item", "move-item", "rename-item", "remove-item",
+}
+
+# 内联脚本里的破坏性调用。
+# 为什么要这一层：上面 _RISKY_RX 只看得见"命令字符串"，看不见 `python -c "..."` 里真正干的事。
+# 实测 `python -c "import os; os.remove('a.txt')"` 会直接放行——换个 API 名字就绕过了审批。
+# 这一层按"代码里出现的 API 名"判定，把 os.remove / Path.unlink / open(...,'w') / shutil.*
+# 这些等价于删除、移动、覆盖的调用重新纳入审批。
+_CODE_RISKY_RX = re.compile(
+    r"os\.remove\b|os\.unlink\b|os\.rmdir\b|os\.removedirs\b|os\.rename\b|os\.replace\b"
+    r"|shutil\.rmtree\b|shutil\.move\b|shutil\.copy"
+    r"|Path\s*\([^)]*\)\s*\.\s*(?:unlink|rmdir|rename|replace|write_text|write_bytes|touch)\s*\("
+    r"|\.unlink\s*\(|\.rmdir\s*\(|\.write_text\s*\(|\.write_bytes\s*\(|\.truncate\s*\("
+    r"|open\s*\([^)\n]*['\"][wax][b+]{0,2}['\"]"        # open(...) 带写/追加/独占模式
+    r"|mode\s*=\s*['\"][wax][b+]{0,2}['\"]"
+    r"|os\.system\b|os\.popen\b|os\.exec|os\.spawn|subprocess\.|pty\.spawn",
+    re.IGNORECASE,
+)
+
+
+def _command_tokens(command: str) -> list:
+    """把命令切成词（保留引号内容）；切不动就退回按空白切。"""
+    cmd = (command or "").strip()
+    if not cmd:
+        return []
+    try:
+        return shlex.split(cmd, posix=False)
+    except Exception:
+        return [t for t in re.split(r"\s+", cmd) if t]
+
+
+def _leading_command_words(command: str) -> list:
+    """找出"真正被执行的命令名"：跳过 & / ; 前缀，拆开 cmd /c、powershell -c 这类包装。"""
+    toks = [t for t in _command_tokens(command) if t.strip("\"'")]
+    while toks and toks[0].strip("\"'") in ("&", ";"):
+        toks.pop(0)
+    if not toks:
+        return []
+    head = os.path.basename(toks[0].strip("\"'")).lower()
+    if head in ("cmd", "powershell", "pwsh"):
+        for i, t in enumerate(toks[1:], 1):
+            if t.strip("\"'").lower() in ("/c", "/k", "-c", "-command"):
+                rest = [x for x in toks[i + 1:] if not x.strip("\"'").startswith("-")]
+                return rest[:1]
+        return []
+    return toks[:1]
+
+
+def _risky_reason(command: str) -> str:
+    """判断一条命令为什么算"有风险"，返回人话原因；没问题返回空串。
+
+    三道判定，从粗到细：
+      1) 命令字面命中危险规则（_RISKY_RX）；
+      2) 内联脚本里出现删除/移动/覆盖类 API（_CODE_RISKY_RX）；
+      3) 真正被执行的命令名本身是 del / copy / robocopy 这类（_RISKY_BIN）。
+    """
+    cmd = command or ""
+    m = _RISKY_RX.search(cmd)
+    if m:
+        return f"命中危险命令规则「{m.group(0).strip()}」"
+    m = _CODE_RISKY_RX.search(cmd)
+    if m:
+        return f"内联脚本里出现「{m.group(0).strip()}」这类会删除/移动/覆盖文件的调用"
+    for tok in _leading_command_words(cmd):
+        name = os.path.basename(tok.strip("\"'")).lower()
+        if name in _RISKY_BIN:
+            return f"命令 {name} 会删除、移动或覆盖文件"
+    return ""
 
 
 def _audit(event: str, **fields) -> None:
@@ -231,8 +312,9 @@ def _command_policy(command: str, cwd: str, tool: str) -> tuple:
             return "deny", (f"错误：命令里这些路径超出了项目目录，已被拒绝：{', '.join(escapes[:5])}\n"
                             f"项目工作目录是：{WORKSPACE}。请只操作项目内的文件。")
         _audit("warn-escape", tool=tool, command=cmd, paths=escapes)
-    # ③ 危险操作
-    if _RISKY_RX.search(cmd):
+    # ③ 危险操作：命令字面 / 内联脚本里的调用 / argv[0] 是否删除类命令，三处任一命中就要审批
+    reason = _risky_reason(cmd)
+    if reason:
         if SECURITY_MODE == "warn":
             _audit("risky-allowed", tool=tool, command=cmd, reason="warn-mode")
             return "allow", ""
@@ -241,9 +323,10 @@ def _command_policy(command: str, cwd: str, tool: str) -> tuple:
             _audit("command-approved", tool=tool, command=cmd)
             return "allow", ""
         _pending.clear()
-        _pending.update({"sig": _sig(cmd), "command": cmd, "tool": tool, "ts": time.time()})
-        _audit("needs-approval", tool=tool, command=cmd)
-        return "deny", ("这条命令属于**有风险的操作**（删除/移动/强推/卸载/杀进程等），已被拦下，"
+        _pending.update({"sig": _sig(cmd), "command": cmd, "tool": tool,
+                         "ts": time.time(), "reason": reason})
+        _audit("needs-approval", tool=tool, command=cmd, reason=reason)
+        return "deny", (f"这条命令属于**有风险的操作**（{reason}），已被拦下，"
                         "并且已经上报给用户确认。\n"
                         "请在回复里告诉用户：要做什么、会有什么后果，请用户确认。\n"
                         "**不要重复调用这条命令，也不要换用别的命令绕过审批。**")
@@ -897,3 +980,120 @@ def web_fetch(url: str, max_chars: int = 6000) -> str:
     text = re.sub(r"&nbsp;", " ", text)
     text = re.sub(r"\s+", " ", text)
     return _truncate(text, max_chars)
+
+
+# ---------------------------------------------------------------------------
+# 联网搜索：web_fetch 只能抓"已知 URL"，模型不知道网址时得先搜
+# ---------------------------------------------------------------------------
+_SEARCH_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def _clean_text(fragment: str) -> str:
+    """去掉标签、还原转义字符，压成一行。"""
+    s = re.sub(r"<[^>]+>", "", fragment or "")
+    s = _html.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _parse_bing_html(page: str, count: int) -> list:
+    """从 Bing 搜索结果页里抽出 [标题, 网址, 摘要]。
+
+    单独拆出来是为了能离线测解析逻辑（不依赖网络，也不会因为页面改版就整段挂掉）。
+    """
+    out = []
+    for block in (page or "").split('<li class="b_algo"')[1:]:
+        m = re.search(r'<h2[^>]*>.*?<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not m:
+            continue
+        sn = re.search(r"<p[^>]*>(.*?)</p>", block, re.S)
+        out.append({
+            "title": _clean_text(m.group(2)),
+            "url": _html.unescape(m.group(1)),
+            "snippet": _clean_text(sn.group(1)) if sn else "",
+        })
+        if len(out) >= count:
+            break
+    return out
+
+
+def _search_bing(query: str, count: int) -> list:
+    """Bing（cn.bing.com）：国内可直连，作为首选。"""
+    r = requests.get(
+        "https://cn.bing.com/search",
+        params={"q": query, "count": count},
+        headers={"User-Agent": _SEARCH_UA,
+                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    return _parse_bing_html(r.text, count)
+
+
+def _search_ddg(query: str, count: int) -> list:
+    """DuckDuckGo HTML 版：国内通常连不上，留作兜底（境外网络更稳）。"""
+    r = requests.get(
+        "https://html.duckduckgo.com/html/",
+        params={"q": query},
+        headers={"User-Agent": _SEARCH_UA},
+        timeout=15,
+    )
+    r.raise_for_status()
+    out = []
+    for part in r.text.split('class="result__a"')[1:]:
+        m = re.search(r'href="([^"]+)"[^>]*>(.*?)</a>', part, re.S)
+        if not m:
+            continue
+        url = _html.unescape(m.group(1))
+        if "uddg=" in url:      # DDG 把真实网址包在跳转链接里
+            url = unquote(url.split("uddg=", 1)[1].split("&", 1)[0])
+        sn = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', part, re.S)
+        out.append({
+            "title": _clean_text(m.group(2)),
+            "url": url,
+            "snippet": _clean_text(sn.group(1)) if sn else "",
+        })
+        if len(out) >= count:
+            break
+    return out
+
+
+def web_search(query: str, count: int = 5) -> str:
+    """联网搜索关键词，返回标题 / 网址 / 摘要（Bing 优先，DuckDuckGo 兜底）。
+
+    为什么要单独一个工具：web_fetch 只能抓"已知 URL"，模型不知道网址时只能瞎猜。
+    有了它才能"先搜到网址，再抓正文"——这也是把"查资料"从"背知识"变成"查资料"的关键一步。
+    搜索失败时如实返回失败，绝不编造结果。
+    """
+    query = (query or "").strip()
+    if not query:
+        return "错误：搜索关键词为空。"
+    try:
+        count = int(count)
+    except Exception:
+        count = 5
+    count = max(1, min(count, 10))
+
+    errors = []
+    for name, fn in (("bing", _search_bing), ("duckduckgo", _search_ddg)):
+        try:
+            hits = fn(query, count)
+        except Exception as e:
+            errors.append(f"{name}：{e}")
+            continue
+        if not hits:
+            errors.append(f"{name}：没有解析到结果")
+            continue
+        lines = [f"搜索「{query}」（{name}，{len(hits)} 条）："]
+        for i, h in enumerate(hits, 1):
+            lines.append(f"{i}. {h['title'] or '(无标题)'}")
+            lines.append(f"   {h['url']}")
+            if h["snippet"]:
+                lines.append(f"   摘要：{h['snippet'][:200]}")
+        lines.append("（摘要可能有偏差，别当结论；要正文就用 web_fetch 打开上面的网址。）")
+        _audit("web_search", query=query, engine=name, results=len(hits))
+        return _truncate("\n".join(lines), MAX_OUTPUT)
+
+    _audit("web_search", query=query, results=0)
+    return ("搜索失败：两个搜索引擎都没给出可用结果（" + "；".join(errors) +
+            "）。请换个关键词，或如实告诉用户搜索暂时不可用——不要编造内容。")

@@ -37,6 +37,10 @@ MAX_LLM_RETRIES = 3    # 模型调用失败（限流/网络/5xx）最多试几�
 HISTORY_TOKEN_BUDGET = 8000   # 历史（含摘要）的 token 预算，超了就压缩
 KEEP_RECENT_MESSAGES = 6      # 压缩历史时，至少原样保留最近几条消息
 SUMMARY_MAX_TOKENS = 800      # 生成历史摘要时允许的最大输出
+
+# 模型返回了空文本（只有空白/没有任何 text 块）时的兜底回答。
+# 微信端绝不能发一条空消息出去——用户会以为机器人挂了，也容易触发平台风控。
+EMPTY_ANSWER = "（我这边没组织出有效回答，请换个说法再问一次，或把问题拆小一点。）"
 LOG = logging.getLogger("wechat-agent")
 
 # 这些状态码表示"临时性失败"，适合重试；4xx 里的参数错误重试也没用
@@ -47,7 +51,7 @@ _RETRY_HINTS = ("ratelimit", "timeout", "connection", "overloaded", "apistatus",
 SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任务。
 - 你有一套通用工具：run_command（运行命令）、run_background / wait_job / check_job / kill_job / list_jobs（长任务）、
   read_file / write_file / edit_file / multi_edit（读写改文件）、
-  list_files / search_text（列文件 / 全文检索）、web_fetch（联网抓取网页）。
+  list_files / search_text（列文件 / 全文检索）、web_search（联网搜索关键词）、web_fetch（抓网页正文）。
 - 命令执行：短命令用 run_command（默认超时 60s，可调到 600s）。预计要跑很久的
   （装依赖、跑测试套件、构建）用 run_background 起后台任务，拿到 job 编号后
   用 wait_job 等它结束（推荐，一次拿到结果）；需要中途瞄一眼就趁 check_job；
@@ -72,6 +76,9 @@ SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任�
      并把验证结果如实告诉用户。验证失败就看报错、修正后重试。
 - 请自己组合这些通用工具完成任务，常见做法：
   - 算数：用 run_command 跑一段脚本，例如 python -c "print(12345*678+91)"。
+  - 查资料 / 找网址：**先用 web_search 搜关键词**，从结果里挑最相关的网址，
+    再用 web_fetch 打开它读全文；不要凭记忆猜网址，也不要只拿搜索摘要当结论。
+    搜索失败或结果为空时如实说明，不要编造网页内容。
   - 查天气：用 web_fetch 调 Open-Meteo 免费接口——先地理编码
     https://geocoding-api.open-meteo.com/v1/search?name=城市&count=1&language=zh 拿经纬度，
     再查 https://api.open-meteo.com/v1/forecast?latitude=..&longitude=..&current=temperature_2m,weather_code。
@@ -400,6 +407,18 @@ TOOLS = [
         },
     },
     {
+        "name": "web_search",
+        "description": "联网搜索关键词，返回若干条结果的标题/网址/摘要。需要查资料、找官网、找链接时先用它，再用 web_fetch 打开具体网页读全文。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词，例如 DeepSeek API 文档"},
+                "count": {"type": "integer", "description": "返回几条结果，默认 5，最大 10"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "add_todo",
         "description": "添加一条待办或提醒。用户说「待办 / 提醒我 / 记住要做…」时使用。due 用 ISO 时间，没有明确时间就留空。",
         "input_schema": {
@@ -532,6 +551,8 @@ def _exec(name: str, args: dict) -> str:
                                    args.get("include", ""))
     if name == "web_fetch":
         return general.web_fetch(args.get("url", ""))
+    if name == "web_search":
+        return general.web_search(args.get("query", ""), args.get("count", 5))
     if name == "add_todo":
         return todos.add_todo(args.get("text", ""), args.get("due", ""))
     if name == "list_todos":
@@ -574,7 +595,12 @@ def run(user_text: str, history=None, summary: str = "") -> str:
 
         tool_uses = [b for b in resp.content if b.type == "tool_use"]
         if not tool_uses:
-            return "".join(b.text for b in resp.content if b.type == "text").strip()
+            answer = "".join(b.text for b in resp.content if b.type == "text").strip()
+            if answer:
+                return answer
+            # 空回复兜底：模型只给了空白/什么都没有时，宁可回一句人话也不要发空消息
+            LOG.warning("模型返回了空回答（第 %d 轮），已用兜底文案", round_no)
+            return EMPTY_ANSWER
 
         results = [] #工具调用结果列表
         for tu in tool_uses:

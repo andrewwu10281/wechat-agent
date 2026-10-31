@@ -6,7 +6,14 @@
 > 最近更新：2026-10-21
 
 ## 项目位置
-`C:\Users\lenovo\wechat-agent`
+`C:\Users\lenovo\projects\wechat-agent`
+
+> 2026-10-21：从 `C:\Users\lenovo\wechat-agent` 迁入 DSH 工作区 `C:\Users\lenovo\projects\`
+> （4783 个文件逐项校验一致、关键文件哈希相同后，原目录已删除）。迁入后可在 DSH 内直接开发、跑三套测试。
+> 代码侧不受影响：所有路径都由 `__file__` 推导，没有硬编码。
+> ⚠️ 唯一副作用：`.venv` 里 `pip.exe` 这类 console script 写死了旧解释器路径，已失效 ——
+> 装包一律用 `.venv\Scripts\python.exe -m pip ...`（README / 原理笔记已同步）。
+> 另：在 DSH 沙箱内 MCP 子进程起不来（命名管道被禁，`WinError 5`），agent 会自动降级为 21 个本地工具。
 
 ## 技术栈
 - Python 3.13（虚拟环境 `.venv/`）
@@ -180,6 +187,30 @@
      待确认登记/清除、指纹不同不放行、一次性失效、同意/拒绝词识别含否定优先）
    - 三套测试合计 **133 项全过**（55 + 47 + 31）
 
+17. **Phase 4.5：堵住"换个 API 名字就绕过审批" + 补联网搜索 + 空回复兜底**（2026-10-21，迁入 DSH 工作区后）
+   - **背景（实测）**：上一版审批只按命令字面匹配，`python -c "import os; os.remove('a.txt')"`、
+     `Path('a').unlink()`、`open('f','w').write('')`、`copy a.txt b.txt` **全部直接放行**——
+     等于删文件不用审批，只要换个 API 名字。
+   - **改法 `_risky_reason()` 三层判定**（`tools/general.py`）：
+     ① 命令字面命中 `_RISKY_RX`（原有）；
+     ② 内联脚本里出现 `os.remove` / `os.rename` / `Path.unlink` / `Path.write_text` / `open(…,'w')` /
+        `shutil.copy|move` / `os.system` / `subprocess.` 这类等价调用（新增 `_CODE_RISKY_RX`）；
+     ③ 真正执行的命令名属于 `del/copy/xcopy/robocopy/mklink/icacls/…`（新增 `_RISKY_BIN`，
+        按 argv[0] 判断，并用 `shlex` 拆开 `cmd /c`、`powershell -c` 包装）。
+     命中后走的还是同一条审批流：登记 `_pending`（带 `reason`）→ 外壳批准 → 指纹绑定 → 一次性。
+   - **新增工具 `web_search`**（`tools/general.py` + `agent.py` 注册与分发）：
+     - 为什么：`web_fetch` 只能抓"已知 URL"，模型不知道网址时只能瞎猜，等于没法查资料；
+     - 实现：Bing（cn.bing.com，国内直连）优先、DuckDuckGo 兜底；解析逻辑单独抽成
+       `_parse_bing_html()` 以便离线测试；结果给标题/网址/摘要，并提示"摘要可能有偏差，正文用 web_fetch"；
+     - 两个引擎都失败时**如实返回"搜索不可用"**，不编造（延续防编造原则）。
+   - **空回复兜底补上**（`PROGRESS` 第 11 条早就宣称有，代码其实一直没写）：
+     `agent.EMPTY_ANSWER` + `run()` 在模型只返回空白时兜底；`bot._handle_msg()` 发送前再兜一次。
+   - **测试**：`test_tools` 47→**52**、`test_context` 31→**35**、`test_security` 55→**85**，
+     合计 **172 项全过**（新增：11 条绕过写法全部要审批、6 条正常命令不误伤、
+     结构化命中后批准只放行一次、空回复三种情形、`web_search` 参数校验与解析器离线自测）。
+   - **实测**：`web_search("DeepSeek API 文档")` 返回 3 条真实结果（标题/网址/摘要齐全）；
+     `python -c "print(6*7)"`、`open('README.md').read()`、字符串 `.replace()` 等正常用法不受影响。
+
 > ⚠️ 过程教训：用 PowerShell 批量替换改 UTF-8 中文源码，会把编码和换行写坏（本次发生过一次，
 > 已 `git checkout` 恢复）。**改中文源码一律用编辑工具，不要用 shell 文本替换。**
 
@@ -187,9 +218,10 @@
 - ~~**Phase 2｜命令执行升级**~~ ✅ 已完成（见上第 13 条）
 - ~~**Phase 3｜上下文与可靠性**~~ ✅ 已完成（见上第 14 条）
 - ~~**Phase 4｜企业级安全**~~ ✅ 已完成（见上第 15 条）
-- **Phase 3｜上下文与可靠性**：历史 token 预算 + 自动摘要压缩；LLM 调用重试/退避
-- **Phase 4｜企业级安全**：命令执行的工作区约束与危险操作审批、审计日志
-- **Phase 5｜像助理**：agent 自身的计划跟踪、周期定时任务
+- ~~**Phase 4.5｜审批口径升级 + 联网搜索 + 空回复兜底**~~ ✅ 已完成（见上第 17 条）
+- **Phase 5｜像助理**：agent 自身的计划跟踪（多步计划 + 步骤状态）、周期定时任务（cron 式）
+- **Phase 6｜工程质量**：bot 层集成测试（假 sess + 假 send_text）、GitHub Actions 跑三套免费测试、
+  后台任务表 `_jobs` 的清理
 
 ## ⚠️ 待验证（下一步）
 1. 【可选】实际跑 `python bot.py` 重新扫码（凭证是 10-02 存的，可能已失效），确认微信端 Scholar 也能回复。

@@ -478,6 +478,11 @@ def _handle_msg(sess: dict, msg: dict, context_tokens: dict,
     if peek_pending_approval():
         answer += "\n\n⚠️ 这条操作有风险，需要你确认：回复「同意」我就执行，回复其他内容视为取消。"
 
+    #发送前最后兜一次空回复：微信端发一条空白消息既没意义，也容易触发风控
+    if not (answer or "").strip():
+        LOG.warning("回答为空，改用兜底文案")
+        answer = "（这条我没能给出有效回答，可以再问一次或说得更具体一点。）"
+
     send_text(sess, from_user, answer, ctx or context_tokens.get(from_user, ""))
     LOG.info("已回复 %s", from_user)
 
