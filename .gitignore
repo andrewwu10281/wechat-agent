@@ -7,3 +7,8 @@ __pycache__/
 *.log
 todos.json
 memory.json
+.browser_profile/
+.ms-playwright/
+.tmp_pw/
+.tmp_pip/
+.tmp_openclaw/

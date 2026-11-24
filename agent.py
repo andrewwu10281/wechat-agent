@@ -15,7 +15,7 @@ from datetime import datetime
 import anthropic
 
 import config
-from tools import general, memory, todos
+from tools import general, memory, todos, media, browser
 try:
     from tools.mcp_client import MCPManager, to_anthropic_tools
 except Exception:
@@ -51,7 +51,9 @@ _RETRY_HINTS = ("ratelimit", "timeout", "connection", "overloaded", "apistatus",
 SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任务。
 - 你有一套通用工具：run_command（运行命令）、run_background / wait_job / check_job / kill_job / list_jobs（长任务）、
   read_file / write_file / edit_file / multi_edit（读写改文件）、
-  list_files / search_text（列文件 / 全文检索）、web_search（联网搜索关键词）、web_fetch（抓网页正文）。
+  list_files / search_text（列文件 / 全文检索）、web_search（联网搜索关键词）、
+  browser_search（用浏览器搜需要登录的站点，目前支持小红书）、web_fetch（抓网页正文）、
+  send_file（把项目里的文件发到微信，需要用户确认）。
 - 命令执行：短命令用 run_command（默认超时 60s，可调到 600s）。预计要跑很久的
   （装依赖、跑测试套件、构建）用 run_background 起后台任务，拿到 job 编号后
   用 wait_job 等它结束（推荐，一次拿到结果）；需要中途瞄一眼就趁 check_job；
@@ -79,6 +81,12 @@ SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任�
   - 查资料 / 找网址：**先用 web_search 搜关键词**，从结果里挑最相关的网址，
     再用 web_fetch 打开它读全文；不要凭记忆猜网址，也不要只拿搜索摘要当结论。
     搜索失败或结果为空时如实说明，不要编造网页内容。
+  - 小红书 / 知乎这类**要登录才能看**的站点：用 browser_search（目前只支持小红书）。
+    它被风控时会自动降级为 web_search，降级结果要说明"是通用搜索的结果，质量可能差一些"。
+    browser_search 的每条结果都带原文链接；回答时必须逐条原样附上链接（即使微信里
+    不能直接点击，也要贴出来方便用户复制），不要只给标题、作者、点赞数。
+  - 发文件：用户说「把 X 发我」时用 send_file；它会先问用户确认，
+    用户回「同意」后才会真的发。凭证类文件（.env、*.key）会被永久拒绝，不要试图绕过。
   - 查天气：用 web_fetch 调 Open-Meteo 免费接口——先地理编码
     https://geocoding-api.open-meteo.com/v1/search?name=城市&count=1&language=zh 拿经纬度，
     再查 https://api.open-meteo.com/v1/forecast?latitude=..&longitude=..&current=temperature_2m,weather_code。
@@ -92,7 +100,8 @@ SYSTEM = """你是一个个人微信助手，可以通过工具自主完成任�
   把「明天 9 点」「周五下午 3 点」等换算成 ISO 时间（YYYY-MM-DDTHH:MM:SS），参考下面的当前时间。
 - 长期记忆：用户说「记住…」时调用 remember_fact；问「你还记得…」或涉及个人情况/偏好时，
   先调用 recall_facts 查一下；说「忘掉…」时调用 forget_fact。
-- 拿到结果后用简洁、自然的中文回答，不要把原始 JSON 或大段数据直接甩给用户。
+- 拿到结果后用简洁、自然的中文回答，不要把原始 JSON 或大段数据直接甩给用户；
+  但搜索结果里的标题、作者和链接要保留，尤其原文链接不能省略。
 - 如果暂时没有合适的工具完成任务，直接说明即可。"""
 
 
@@ -398,6 +407,31 @@ TOOLS = [
         },
     },
     {
+        "name": "send_file",
+        "description": "把项目里的一个文件通过微信发给用户（需要用户确认）。适合发报告、图片、脚本、压缩包等成品；凭证类文件（.env、*.key、*.pem）会被永久拒绝。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "相对项目根目录的文件路径"},
+                "note": {"type": "string", "description": "附带给用户的一句话说明，可空"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "browser_search",
+        "description": "用浏览器打开需要登录/JS 渲染的站点搜索，目前支持小红书（site=xiaohongshu）。返回标题/作者/点赞/原文链接；被风控时会自动降级为通用搜索。回复用户时必须逐条附上原文链接，不要省略。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词，例如 agent 开发"},
+                "site": {"type": "string", "description": "站点，默认 xiaohongshu"},
+                "limit": {"type": "integer", "description": "返回几条，默认 5，最大 10"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "web_fetch",
         "description": "抓取一个网页并返回其中的纯文本（用于联网检索、查天气、查资料等）。",
         "input_schema": {
@@ -553,6 +587,11 @@ def _exec(name: str, args: dict) -> str:
         return general.web_fetch(args.get("url", ""))
     if name == "web_search":
         return general.web_search(args.get("query", ""), args.get("count", 5))
+    if name == "send_file":
+        return media.send_file(args.get("path", ""), args.get("note", ""))
+    if name == "browser_search":
+        return browser.browser_search(args.get("query", ""), args.get("site", "xiaohongshu"),
+                                      args.get("limit", 5))
     if name == "add_todo":
         return todos.add_todo(args.get("text", ""), args.get("due", ""))
     if name == "list_todos":

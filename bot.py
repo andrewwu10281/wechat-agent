@@ -17,6 +17,7 @@
 协议细节参照官方插件 openclaw-weixin（Tencent/openclaw-weixin）。
 """
 import base64
+import hashlib
 import json
 import logging  #打日志（LOG.info(...)）
 import os       #拼文件路径、判断文件在不在、用看图软件打开二维码
@@ -27,7 +28,8 @@ import time
 from urllib.parse import quote
 import requests  #发 HTTP 请求（收消息、发消息)
 from agent import run, compact_history
-from tools.context import set_current_user
+from tools.context import set_current_user, get_current_user
+from tools import media as media_tools
 from tools.general import peek_pending_approval, arm_pending_approval, deny_pending_approval
 from tools.todos import due_reminders, mark_reminded
 
@@ -362,6 +364,163 @@ def send_text(sess: dict, to_user_id: str, text: str, context_token: str = "") -
 #区别：get_updates 的 ret 非 0 时，主循环有专门处理（errcode == -14 等），所以不在函数内抛。send_text 是“一次性操作”，失败就该抛，让调用方处理。
 
 
+#发文件：与官方 openclaw-weixin 2.4.10 完全一致的三步协议
+#   ① POST {base}/ilink/bot/getuploadurl 申请上传参数（filekey/aeskey/明文大小/md5）
+#   ② 用 AES-128-ECB(PKCS#7) 加密文件，POST 密文到微信 CDN；
+#      响应头 x-encrypted-param 就是下载参数（不是响应体里的 url）
+#   ③ sendmessage 放一个 type=4 的 file_item，用 media.encrypt_query_param 引用 CDN
+#   旧实现把文件 multipart POST 到 /ilink/bot/upload，该接口不存在，所以一直 404。
+#   任何一步失败都抛异常，由 tools/media.py 捕获并降级成"文件卡片"，不会拖垮整轮对话。
+CDN_BASE_URL = os.getenv("ILINK_CDN_BASE_URL", "https://novac2c.cdn.weixin.qq.com/c2c")
+
+
+def _aes_ecb_padded_size(size: int) -> int:
+    """PKCS#7 填充后的密文长度：ceil((n+1)/16)*16（与官方 aesEcbPaddedSize 一致）。"""
+    return ((size + 1 + 15) // 16) * 16
+
+
+def _encrypt_aes_ecb(plaintext: bytes, key: bytes) -> bytes:
+    """AES-128-ECB + PKCS#7，微信 CDN 要求的加密方式。"""
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except ImportError as e:  # 缺依赖时给出可执行的提示，而不是让整轮对话崩掉
+        raise RuntimeError("缺少 cryptography 依赖：.venv\\Scripts\\pip install cryptography") from e
+    pad = 16 - len(plaintext) % 16
+    padded = plaintext + bytes([pad]) * pad
+    enc = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return enc.update(padded) + enc.finalize()
+
+
+def _cdn_upload_url(upload_param: str, filekey: str) -> str:
+    """没有 upload_full_url 时，按官方格式拼 CDN 上传地址。"""
+    return (f"{CDN_BASE_URL}/upload?encrypted_query_param={quote(upload_param, safe='')}"
+            f"&filekey={quote(filekey, safe='')}")
+
+
+def _build_file_item(name: str, size: int, encrypt_query_param: str, aes_key_b64: str,
+                     item_type: int = 4, item_key: str = "file_item",
+                     cipher_size: int = 0) -> dict:
+    """构造媒体消息的一个 item（纯函数，方便离线测试）。
+
+    type=4/file_item 用 file_name + len（明文大小）；图片/视频的 item 用 *_size（密文大小）。
+    """
+    item = {
+        "media": {
+            "encrypt_query_param": encrypt_query_param,
+            "aes_key": aes_key_b64,
+            "encrypt_type": 1,
+        },
+    }
+    if item_type == 4:        # file_item
+        item["file_name"] = name
+        item["len"] = str(size)
+    elif item_type == 2:      # image_item
+        item["mid_size"] = cipher_size
+    elif item_type == 5:      # video_item
+        item["video_size"] = cipher_size
+    return {"type": item_type, item_key: item}
+
+
+def _get_upload_url(sess: dict, to_user_id: str, plaintext: bytes,
+                    filekey: str, aeskey: bytes, media_type: int = 3) -> dict:
+    """① 申请上传参数。media_type: 1=图片 2=视频 3=文件 4=语音。"""
+    body = {
+        "filekey": filekey,
+        "media_type": media_type,
+        "to_user_id": to_user_id,
+        "rawsize": len(plaintext),
+        "rawfilemd5": hashlib.md5(plaintext).hexdigest(),
+        "filesize": _aes_ecb_padded_size(len(plaintext)),
+        "no_need_thumb": True,   # 文件/视频不需要缩略图；图片走缩略图时才置 False
+        "aeskey": aeskey.hex(),
+        "base_info": _base_info(),
+    }
+    resp = requests.post(f"{sess['baseurl']}/ilink/bot/getuploadurl",
+                         headers=_post_headers(sess["bot_token"]), json=body, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("ret") not in (0, None):
+        raise RuntimeError(f"getUploadUrl ret={data.get('ret')} errmsg={data.get('errmsg')}")
+    return data
+
+
+def _upload_ciphertext(ciphertext: bytes, upload_url: str, attempts: int = 3) -> str:
+    """② POST 密文到 CDN，返回下载参数；4xx 立即失败，5xx/网络错误重试。"""
+    last_err: Exception | None = None
+    for i in range(attempts):
+        try:
+            resp = requests.post(upload_url,
+                                 headers={"Content-Type": "application/octet-stream"},
+                                 data=ciphertext, timeout=120)
+        except requests.RequestException as e:
+            last_err = e
+        else:
+            if resp.status_code == 200:
+                param = resp.headers.get("x-encrypted-param")
+                if not param:
+                    raise RuntimeError("CDN 返回 200 但缺少 x-encrypted-param 响应头")
+                LOG.info("CDN 上传成功：%d 字节密文", len(ciphertext))
+                return param
+            detail = resp.headers.get("x-error-message") or resp.text[:300]
+            if 400 <= resp.status_code < 500:   # 参数过期/被拒，重试无意义
+                raise RuntimeError(f"CDN 上传失败（HTTP {resp.status_code}）：{detail}")
+            last_err = RuntimeError(f"CDN 上传失败（HTTP {resp.status_code}）：{detail}")
+        time.sleep(0.5 * (i + 1))
+    raise RuntimeError(f"CDN 上传重试 {attempts} 次仍失败：{last_err}")
+
+
+def send_file_message(sess: dict, to_user_id: str, local_path: str,
+                      display_name: str = "", context_token: str = "") -> str:
+    name = display_name or os.path.basename(local_path)
+    with open(local_path, "rb") as f:
+        plaintext = f.read()
+    rawsize = len(plaintext)
+
+    media_type = int(os.getenv("ILINK_MEDIA_TYPE", "3"))       # 3=文件
+    item_type = int(os.getenv("ILINK_FILE_ITEM_TYPE", "4"))    # 4=file_item
+    item_key = os.getenv("ILINK_FILE_ITEM_KEY", "file_item")
+
+    filekey = secrets.token_hex(16)          # 32 个 hex 字符
+    aeskey = secrets.token_bytes(16)         # AES-128 key
+
+    # ① 申请上传参数
+    up = _get_upload_url(sess, to_user_id, plaintext, filekey, aeskey, media_type=media_type)
+    upload_url = (up.get("upload_full_url") or "").strip()
+    if not upload_url and up.get("upload_param"):
+        upload_url = _cdn_upload_url(up["upload_param"], filekey)
+    if not upload_url:
+        raise RuntimeError(f"getUploadUrl 没有返回 upload_param/upload_full_url：{str(up)[:300]}")
+
+    # ② 加密后上传到 CDN
+    ciphertext = _encrypt_aes_ecb(plaintext, aeskey)
+    LOG.info("发送文件 %s：明文 %d 字节，密文 %d 字节", name, rawsize, len(ciphertext))
+    download_param = _upload_ciphertext(ciphertext, upload_url)
+
+    # ③ 发文件消息：aes_key 与官方一致，base64(hex 字符串)，不是 base64(原始 16 字节)
+    aes_key_b64 = base64.b64encode(aeskey.hex().encode("ascii")).decode("ascii")
+    item = _build_file_item(name, rawsize, download_param, aes_key_b64,
+                            item_type=item_type, item_key=item_key,
+                            cipher_size=len(ciphertext))
+    msg = {
+        "from_user_id": "",
+        "to_user_id": to_user_id,
+        "client_id": secrets.token_hex(16),
+        "message_type": 2,
+        "message_state": 2,
+        "item_list": [item],
+    }
+    if context_token:
+        msg["context_token"] = context_token
+    resp = requests.post(f"{sess['baseurl']}/ilink/bot/sendmessage",
+                         headers=_post_headers(sess["bot_token"]),
+                         json={"msg": msg, "base_info": _base_info()}, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("ret") not in (0, None):
+        raise RuntimeError(f"sendmessage(file) ret={data.get('ret')} errmsg={data.get('errmsg')}")
+    return f"已发送文件 {name}（{rawsize / 1024:.1f} KB）"
+
+
 def _notify(sess: dict, endpoint: str) -> None:
     """启动/停止通知，尽力而为，失败不影响收发。"""
     try:
@@ -443,6 +602,23 @@ def _handle_msg(sess: dict, msg: dict, context_tokens: dict,
     set_current_user(from_user)
 
     #审批流：如果上一条危险命令还在等确认，看这次回复是不是"同意/拒绝"
+    # 审批流（文件）：上一条"发文件"还在等确认，看这次回复是不是同意/拒绝
+    file_pending = media_tools.peek_send_pending()
+    if file_pending:
+        if _is_affirmative(text):
+            path = media_tools.arm_send_file()
+            LOG.info("用户已批准发送文件：%s", path)
+            text = (f"用户已经明确同意发送这个文件，请立刻调用 send_file(path=\"{path}\") "
+                    f"把它发出去，不要换成别的文件。")
+        elif _is_negative(text):
+            media_tools.deny_send_file()
+            LOG.info("用户拒绝发送文件")
+            text = "用户拒绝发送刚才那个文件，请不要再尝试，并说明已经取消。"
+        else:
+            media_tools.deny_send_file()
+            LOG.info("用户没答复文件审批，已清除待确认")
+
+    #审批流：如果上一条危险命令还在等确认，看这次回复是不是"同意/拒绝"
     pending = peek_pending_approval()
     if pending:
         if _is_affirmative(text):
@@ -474,9 +650,11 @@ def _handle_msg(sess: dict, msg: dict, context_tokens: dict,
         ]
         histories[from_user] = {"messages": msgs[-MAX_HISTORY:], "summary": summary}
 
-    #如果这轮模型又提出了危险操作，明确提示用户需要确认
+    #如果这轮模型又提出了危险操作/要发文件，明确提示用户需要确认
     if peek_pending_approval():
         answer += "\n\n⚠️ 这条操作有风险，需要你确认：回复「同意」我就执行，回复其他内容视为取消。"
+    elif media_tools.peek_send_pending():
+        answer += "\n\n⚠️ 要把文件发出去，需要你确认：回复「同意」我就发，回复其他内容视为取消。"
 
     #发送前最后兜一次空回复：微信端发一条空白消息既没意义，也容易触发风控
     if not (answer or "").strip():
@@ -535,6 +713,15 @@ def main() -> None:
     context_tokens: dict = {}  # user_id -> 最近一次 context_token
     histories: dict = {}       # user_id -> {"messages": [...], "summary": "..."}
     seen_ids: set = set()      # 已处理过的消息 id，用于去重
+
+    #把"真正发文件"的能力注册给工具层（tools/media.py 不 import bot，避免循环依赖）
+    def _file_transport(abs_path: str, display_name: str) -> str:
+        # 默认发给"当前正在对话的用户"；如果配了 ILINK_SEND_TO（比如摸到了文件传输助手的 id），优先用它
+        uid = os.getenv("ILINK_SEND_TO", "").strip() or get_current_user()
+        return send_file_message(sess, uid, abs_path, display_name,
+                                 context_tokens.get(uid, ""))
+
+    media_tools.set_transport(_file_transport)
 
     try:
         #主循环：一直长轮询，收到消息就处理

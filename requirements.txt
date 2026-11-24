@@ -1,5 +1,6 @@
 anthropic>=0.40
 requests
+cryptography>=41
 python-dotenv
 qrcode[pil]
 mcp>=2.0

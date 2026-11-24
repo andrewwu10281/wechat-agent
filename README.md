@@ -46,6 +46,8 @@
 | `list_files` / `search_text` | 按通配符列文件 / 按正则全文检索（类 glob / grep），`search_text` 可用 `include="*.py"` 按文件名筛选 |
 | `web_search` | **联网搜索**关键词，返回标题 / 网址 / 摘要（Bing 优先、DuckDuckGo 兜底）；拿到网址再用 `web_fetch` 读正文 |
 | `web_fetch` | 联网抓取网页文本（可用于检索、查资料等） |
+| `send_file` | 把项目里的文件**通过微信发给用户**：凭证类文件（`.env` / `*.key` / `id_rsa`）永久拒绝；其余文件需人工确认；协议不通时自动降级为「文件卡片」（路径 + 大小 + sha256） |
+| `browser_search` | 用**浏览器**打开需要登录/JS 渲染的站点搜索（目前支持小红书）：持久化登录态、限频、缓存、风控检测，失败自动降级为 `web_search` |
 
 **超长输出保留「头部 + 尾部」**：命令的报错通常在末尾，只砍尾部会把最有用的信息丢掉。
 
@@ -76,6 +78,7 @@
 | **危险操作需人工审批** | 删除/移动改名/`git reset --hard`/`git push --force`/卸载包/杀进程/改权限 → 先拦下并把这条命令登记为"待确认"；**批准权在 `bot.py` 这一层，模型没有对应工具、无法自行批准**。你在微信里回复"同意"，命令才被放行一次（且绑定命令指纹，换命令无效） |
 | **换个写法也绕不过** | 判定不只看命令字面：真正执行的是不是 `del` / `copy` / `xcopy` / `robocopy`，以及 `python -c "…"` 里有没有 `os.remove` / `Path.unlink` / `open(…,'w')` / `shutil.copy` 这类等价调用，都会纳入审批 |
 | **审计日志** | 每次命令、写文件、拦截、待确认、批准/拒绝都追加一行 JSON 到 `audit.log`（已 gitignore）；可问"你刚才干了什么"（`read_audit_log`） |
+| **文件外发管控** | 发文件是数据外泄面：`.env`、`.wcbot_session.json`、`*.key`/`*.pem`/`*.p12`、`id_rsa`、`.git/` **永久拒绝（审批也不行）**；其余文件需人工确认，绑定文件指纹、一次性、300 秒过期；审计记录路径 / 大小 / sha256 |
 
 **审批发生在微信对话里**（不是弹窗、也不是模型自己说了算）：模型会说"我要删 X，会有什么后果，你同意吗"，你回"可以"它才执行。
 
@@ -148,6 +151,15 @@ python -m venv .venv
 ```bash
 # 工具层单元测试：不花 API 费用，验证读写改文件的每个行为
 .venv\Scripts\python test_tools.py
+.venv\Scripts\python test_context.py
+.venv\Scripts\python test_security.py
+.venv\Scripts\python test_media.py
+.venv\Scripts\python test_browser.py
+
+# 浏览器搜索（小红书）需要额外装一次：
+# .venv\Scripts\python -m pip install playwright
+# 内核装到项目内（本机 %LOCALAPPDATA% 无写权限，直接 install 会 EPERM）：
+.venv\Scripts\python -m tools.browser install
 
 # 端到端冒烟测试：会真实调用 DeepSeek，验证算数/天气/学术/通用工具
 .venv\Scripts\python smoke_test.py
@@ -163,8 +175,56 @@ python -m venv .venv
 - 工具调用最多 20 轮；同一工具 + 同一参数重复太多次会被拦截，防止死循环。
 - **空回复兜底**：模型只返回空白（或干脆没有文本）时，会用一句人话兜底，绝不给你发空消息
   （微信端空白消息既没意义，也容易触发风控）。
+- **发文件**：说「把这个文件发我」时，模型会调用 `send_file`；**凭证类文件永久拒绝**，
+  其余文件需要你回复「同意」才发。传输层按官方插件 `openclaw-weixin` 的真实协议实现：
+  `getuploadurl` 申请参数 → **AES-128-ECB 加密后上传到微信 CDN** → `sendmessage` 发
+  `file_item`（`media.encrypt_query_param` 引用 CDN 参数）。上传或发送失败时自动降级为
+  「文件卡片」（路径 + 大小 + sha256）。
+  可用 `ILINK_CDN_BASE_URL` 覆盖 CDN 域名；`ILINK_MEDIA_TYPE` / `ILINK_FILE_ITEM_TYPE` /
+  `ILINK_FILE_ITEM_KEY` 仅用于排查图片/视频形态。验证链路：
+  `python probe_send_file.py`（只读打印计划），确认后 `--send 文件名` 真发一次。
 - 调试群消息：设置环境变量 `DEBUG_MSG=1` 后启动 bot，会把收到的每条原始消息打印到日志，
   方便观察群聊字段结构（仅本地调试用；日志含消息内容，勿外传）。
+
+## 浏览器搜索（小红书）
+
+`browser_search` 用 Playwright 开真浏览器，能拿到"必须登录才能看"的内容（小红书、知乎这类）。
+
+```bash
+# 1) 装库（只需一次）
+.venv\Scripts\python -m pip install playwright
+# 2) 装 Chromium 内核（装到项目内的 .ms-playwright/，避开 %LOCALAPPDATA% 的 EPERM）
+.venv\Scripts\python -m tools.browser install
+# 3) 看状态：playwright / 内核 / 登录态
+.venv\Scripts\python -m tools.browser status
+# 4) 首次扫码登录（会弹出浏览器，扫码后回终端按回车）
+.venv\Scripts\python -m tools.browser login
+# 5) 不经过微信，真搜一次
+.venv\Scripts\python -m tools.browser search "agent 学习"
+```
+
+网络慢导致内核下载失败时，先设镜像再跑第 2 步（注意：这是 **PowerShell** 写法）：
+
+```powershell
+$env:PLAYWRIGHT_DOWNLOAD_HOST="https://npmmirror.com/mirrors/playwright"
+```
+
+如果你用的是 cmd.exe，对应写法是：
+
+```cmd
+set PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
+```
+
+- **首次要人工登录**：`BROWSER_HEADLESS=0`（默认）跑一次，弹出的浏览器里扫码登录，
+  cookie 存在 `.browser_profile/`（已 gitignore），之后免登录；过期了再人工过一次。
+- **临时目录**：Playwright 安装/启动时的临时目录统一放项目内 `.tmp_pw/`（已 gitignore），
+  因为本机系统 `%TEMP%` 不可写；要换位置可设 `XHS_TMP_DIR`。万一仍报
+  `EPERM ... playwright-artifacts`，先确认该目录可写再重试。
+- **限频与缓存**：`XHS_MIN_INTERVAL`（默认 30 秒）、`XHS_CACHE_TTL`（默认 600 秒）。
+  别调太低，会触发风控。
+- **失败会降级**：登录墙 / 滑块 / 选择器失效 → 明确报错 + 退回 `web_search`，
+  并在回复里说明"这是通用搜索的结果"。
+- **合规提醒**：只做低频、个人用途的检索，不做批量抓取。
 
 ## 风险提示
 

@@ -211,21 +211,136 @@
    - **实测**：`web_search("DeepSeek API 文档")` 返回 3 条真实结果（标题/网址/摘要齐全）；
      `python -c "print(6*7)"`、`open('README.md').read()`、字符串 `.replace()` 等正常用法不受影响。
 
+18. **Phase 2 需求：把文件通过微信发给用户（`send_file`）**（2026-10-21）
+   - **需求来源**：导师二阶段验收——"能不能把电脑上的文件通过微信发出去"。
+   - **为什么单独建模块**（新增 `tools/media.py`）：① 发文件是**数据外泄面**——agent 能读 `.env`，
+     一旦能发文件就能把密钥发出去，所以"能不能发"（策略）必须和"怎么发"（传输）分开、可独立测试；
+     ② `general.py` 已 1100 行，再塞文件和浏览器会变成上帝文件。
+   - **策略层**：凭证类文件**永久拒绝**（`.env`、`.wcbot_session.json`、`*.key/pem/pfx/p12`、
+     `id_rsa`、`.git/`、`audit.log`），不走审批、不给绕过；其余文件限定项目内、单文件 ≤20MB；
+     发送需**人工确认**（登记 `_pending` → 外壳 `arm_send_file()` 放行 → **绑定文件指纹 sha256[:16]** →
+     一次性 → 300 秒过期）。批准权在外壳，模型没有对应工具。
+   - **传输层**：微信 ilink 的"文件消息"字段**没有公开文档**，`bot.send_file_message()` 按最可能的实现写
+     （上传 multipart → 拿 url → `item_list` 用 file item），三处都能用环境变量覆盖：
+     `ILINK_UPLOAD_PATH` / `ILINK_FILE_ITEM_TYPE` / `ILINK_FILE_URL_FIELD`。
+     协议不通时降级为「文件卡片」（路径 + 大小 + sha256），不拖垮对话。
+   - **可发现性**：新增 `probe_send_file.py`——默认只读（打印假设字段），
+     `--send 文件名` 才真发一次并打印 HTTP 状态与返回 JSON，用来摸协议。
+   - **审计**：`send_file-blocked / -needs-approval / -approved / -denied / -fallback / send_file`。
+   - **测试**：新增 `test_media.py` **28 项全过**，**四套合计 200 项全过**（52 + 35 + 85 + 28）。
+   - ⚠️ **未验证**：真实微信文件发送（要有效凭证 + 摸清协议字段）。
+
+19. **Phase 2 需求：浏览器搜索（小红书）`browser_search`**（2026-10-21）
+   - **需求来源**：导师二阶段验收——"打开小红书，搜最近的 agent 新闻"。
+   - **为什么不能用 `web_fetch`**：这类站点搜索结果要登录 + JS 渲染，纯 HTTP 只能拿到登录页。
+     浏览器自动化是唯一现实解法。
+   - **新增 `tools/browser.py`**：Playwright 起**持久化上下文**（`.browser_profile/` 存 cookie，
+     首次人工扫码，之后免登录）→ 打开搜索页 → 等卡片渲染 → 滚两屏触发懒加载 →
+     `page.evaluate` 抽标题/作者/点赞/链接 → 返回结构化文本。
+   - **四道工程处理**：
+     ① **软依赖**：playwright 没装 → 返回安装命令 + 降级 web_search，不崩；
+     ② **限频 + 缓存**：`XHS_MIN_INTERVAL`（默认 30s）、`XHS_CACHE_TTL`（默认 600s），防风控；
+     ③ **风控识别**：登录墙 / 滑块 / 选择器失效 → 如实报错并降级，**不返回登录占位**；
+     ④ **解析与抓取分离**：`_format_notes()` / `_normalize_notes()` 是纯函数，
+        离线可测（照搬 `web_search` 的 `_parse_bing_html` 思路）。
+   - **文件发送的补充**：`send_file_message` 抽出纯函数 `_build_file_item()`，
+     新增 `ILINK_FILE_ITEM_KEY`（默认 `file_item`，图片可换 `image_item`）与
+     `ILINK_SEND_TO`（默认发给当前用户，摸到文件传输助手 id 后可覆盖）；
+     `probe_send_file.py` 支持 `--type/--key/--url-field/--upload-path` 换假设试。
+   - **测试**：新增 `test_browser.py` **25 项全过**（参数校验、格式化、清洗、未安装降级、
+     limit、缓存、限频、抓取失败降级、诊断、审计），`test_media.py` 扩到 **31 项**。
+     **五套合计 228 项全过**（52 + 35 + 85 + 31 + 25）。
+   - ⚠️ **未验证 / 环境限制**：
+     - 本机（DSH 沙箱）**装不上 playwright**：pip 解包时 `Permission denied`（沙箱限制），
+       所以浏览器路径**没有真机跑过**；离线逻辑已由 25 项测试覆盖。
+     - 真实小红书搜索需要在你自己机器上 `pip install playwright && playwright install chromium`
+       后跑一次（首次要人工扫码）。
+   - **踩到的真 bug**：`xiaohongshu_search` 里给模块级 `_last_call` 赋值却没写 `global`，
+     导致 `UnboundLocalError`——被测试第 7 项当场抓到，已修。
+
+20. **修复真实微信文件发送（404）**（2026-11-22）
+    - **现象**：微信里让 bot 发文件，`audit.log` 记录
+      `send_file-fallback error: 404 Client Error: Not Found for url: https://ilinkai.weixin.qq.com/ilink/bot/upload`，
+      用户只收到「文件卡片」。
+    - **根因**：第 18 条的传输层是**猜的**——iLink 根本没有 `/ilink/bot/upload` 这个接口。
+      真实协议在官方插件 `@tencent-weixin/openclaw-weixin` 2.4.10 源码里（`src/cdn/upload.ts`、
+      `src/cdn/cdn-upload.ts`、`src/messaging/send.ts`）。
+    - **正确链路**（三步）：
+      ① `POST /ilink/bot/getuploadurl`，body `{filekey(32hex), media_type:3, to_user_id, rawsize,
+      rawfilemd5, filesize=ceil((rawsize+1)/16)*16, no_need_thumb:true, aeskey(32hex), base_info}`，
+      返回 `upload_full_url` 或 `upload_param`；
+      ② 明文 AES-128-ECB + PKCS#7 加密，POST 密文到 `https://novac2c.cdn.weixin.qq.com/c2c/upload?...`
+      （仅 `Content-Type: application/octet-stream`），从响应头 `x-encrypted-param` 取下载参数；
+      ③ `sendmessage` 发 `{type:4, file_item:{media:{encrypt_query_param, aes_key, encrypt_type:1},
+      file_name, len:str(明文大小)}}`。**注意** `aes_key` 官方实现是 `base64(hex字符串)`，
+      不是 `base64(原始16字节)`，已照抄兼容。
+    - **实现**：`bot.py` 新增 `_aes_ecb_padded_size` / `_encrypt_aes_ecb` / `_cdn_upload_url` /
+      `_get_upload_url` / `_upload_ciphertext`，重写 `_build_file_item` 与 `send_file_message`；
+      删除过时的 `ILINK_UPLOAD_PATH` / `ILINK_FILE_URL_FIELD`；新增 `ILINK_CDN_BASE_URL`、
+      `ILINK_MEDIA_TYPE`（默认 3=文件）；`aes_key` 按官方格式生成。
+    - **依赖**：`cryptography`（AES-128-ECB），已加入 `requirements.txt`。
+    - **测试**：`test_media.py` 第 9 节改为新 item 结构，并加 PKCS#7 长度、CDN URL 编码、
+      AES 已知答案向量；**34 项全过**；其余四套（52/35/85/25）不受影响。
+    - **真机验证**：`probe_send_file.py --send README.md` 走完整链路成功
+      （getuploadurl → CDN 上传 → sendmessage ret=0），微信端应收到 README.md；
+      运行中的 bot 是旧进程，需重启 `bot.py` 才加载新代码。
+    - **教训**：协议类实现不能靠"最可能的猜测 + env 覆盖"，要直接读官方客户端源码；
+      上线前至少用 `probe` 真发一次。
+
 > ⚠️ 过程教训：用 PowerShell 批量替换改 UTF-8 中文源码，会把编码和换行写坏（本次发生过一次，
 > 已 `git checkout` 恢复）。**改中文源码一律用编辑工具，不要用 shell 文本替换。**
+
+21. **小红书搜索：Chromium 装不上 & 验证路径打通**（2026-11-22）
+    - **现象**：用户在自己终端跑 `playwright install chromium` 报
+      `EPERM: operation not permitted, mkdir 'C:\Users\lenovo\AppData\Local\ms-playwright'`；
+      DSH 沙箱里还额外遇到系统 Temp 的 `mkdtemp EPERM` 与下载子进程 `spawn EPERM`。
+    - **处理**：
+      ① `tools/browser.py` 把 `PLAYWRIGHT_BROWSERS_PATH` 默认指到 `<项目>/.ms-playwright`，
+      不再碰 `%LOCALAPPDATA%`（可用环境变量覆盖）；
+      ② 新增 `python -m tools.browser install`：强制 `TMP`/`TEMP` 到项目内 `.tmp_pw/` 后
+      调用 `playwright install chromium`，绕开系统 Temp 的权限问题；
+      ③ `browser_status()` 增加「Chromium 内核」状态；`_search_impl` 在内核缺失时直接给出
+      安装命令，不再只报 `Executable doesn't exist`；
+      ④ `.gitignore` 补上 `.browser_profile/`、`.ms-playwright/`、`.tmp_pw/`、`.tmp_pip/`、
+      `.tmp_openclaw/`。
+    - **补充**：用户最终装好内核后发现两处问题并修掉：
+      ⑤ 新版 Chrome for Testing 目录是 `chrome-win64/`，`_chromium_ready()` 原 glob
+      `chrome-win/chrome.exe` 检测不到，改为 `chromium-*/chrome-*/chrome.exe`；
+      ⑥ `login` 启动时 Playwright 在系统 Temp 建 `playwright-artifacts-*` 仍会
+      `EPERM mkdtemp`，新增 `_ensure_temp_dir()`：安装/登录/搜索一律把
+      `tempfile.tempdir` 和 `TMP`/`TEMP` 强制切到项目内 `.tmp_pw/`（可用 `XHS_TMP_DIR`
+      覆盖）；不再试探系统 Temp，避免每次启动都踩同一个坑。
+    - **测试**：`test_browser.py` 扩到 **26 项全过**（新增内核状态断言；`xhs 别名` 用例
+      不再依赖本机是否装过 playwright）；`pip install playwright` 成功
+      （playwright 1.65.2 / greenlet 3.5.6）。
+    - **状态**：库与内核都已装好（`.ms-playwright/chromium-1255/chrome-win64/chrome.exe`），
+      登录态尚未建立。真机验证顺序：`tools.browser login` 扫码 →
+      `tools.browser search "关键词"`；离线逻辑（格式化/缓存/限频/降级/审计）已被测试覆盖，
+      但 DOM 选择器只有真跑才能确认。
+    - **限制**：DSH 沙箱内启动浏览器会报
+      `Cannot launch Node.js executable ... [WinError 5]`，属沙箱执行限制；用户本机
+      `playwright install` 能跑通，说明不影响真机。
+    - **教训**：Windows 上 `%LOCALAPPDATA%` 未必可写，浏览器/缓存这类大目录优先放项目内，
+      并用环境变量显式指定，别依赖默认路径。
 
 ## 📋 后续路线（对标 Codex，逐阶段推进）
 - ~~**Phase 2｜命令执行升级**~~ ✅ 已完成（见上第 13 条）
 - ~~**Phase 3｜上下文与可靠性**~~ ✅ 已完成（见上第 14 条）
 - ~~**Phase 4｜企业级安全**~~ ✅ 已完成（见上第 15 条）
 - ~~**Phase 4.5｜审批口径升级 + 联网搜索 + 空回复兜底**~~ ✅ 已完成（见上第 17 条）
-- **Phase 5｜像助理**：agent 自身的计划跟踪（多步计划 + 步骤状态）、周期定时任务（cron 式）
+- ~~**Phase 4.6｜文件外发（send_file）+ 数据外泄管控**~~ ✅ 已完成（见上第 18 条）
+- **Phase 5｜像助理**：agent 自身的计划跟踪（多步计划 + 步骤状态）、周期定时任务（cron 式）、
+  浏览器自动化工具（`browser_search`，Playwright + 登录态 + 降级）
 - **Phase 6｜工程质量**：bot 层集成测试（假 sess + 假 send_text）、GitHub Actions 跑三套免费测试、
   后台任务表 `_jobs` 的清理
 
 ## ⚠️ 待验证（下一步）
 1. 【可选】实际跑 `python bot.py` 重新扫码（凭证是 10-02 存的，可能已失效），确认微信端 Scholar 也能回复。
 2. `SCHOLAR_ID` 可选填：在 agent 里按姓名搜到自己后，把返回的数字 ID 填进 `.env`，即可「查一下我的 Scholar」。
+3. **小红书搜索真机验证**：`.venv\Scripts\python -m tools.browser install` 装内核（项目内）→
+   `python -m tools.browser login` 扫码 → `python -m tools.browser search "关键词"`；
+   再去微信里发一句搜索请求确认端到端。离线 26 项已过，DOM 选择器仍需真跑确认。
+4. **重启 bot** 加载文件发送修复（旧进程还跑着 18:24 的代码）。
 
 ## 🗂 历史（已放弃的方案）
 之前用 wcferry Hook 微信 PC 客户端，卡在「注入失败（WxInitSDK != 0）」，且要求 wcferry
